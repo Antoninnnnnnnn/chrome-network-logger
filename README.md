@@ -88,3 +88,7 @@ This tool captures **plaintext passwords, tokens, session cookies, and any text 
 ## 📜 License
 
 MIT
+
+---
+
+> 🤖 **Full disclosure:** This project was built by [@Antonin2938](https://github.com/Antonin2938) who freely admits he doesn't understand a single line of this code. The real MVP here is AI pair programming. Turns out you don't need to know how to code to ship code. Welcome to 2026.
