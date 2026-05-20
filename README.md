@@ -58,6 +58,8 @@ http://host:port
 https://user:pass@host:port
 socks5://host:port
 socks4://user:pass@host:port
+host port              (space/tab-separated)
+host port user pass    (space/tab-separated, e.g. Decodo / Bright Data exports)
 ```
 
 If credentials are present, a tiny unpacked Chrome extension is generated on the fly to feed them to `webRequest.onAuthRequired` (no auth prompt).

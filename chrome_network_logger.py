@@ -308,12 +308,15 @@ def find_chrome():
 
 def parse_proxy_line(line):
     """Auto-detect proxy format. Returns dict or None.
-    Supported:
+    Supported separators: ':' OR whitespace (tab/space).
+    Supported formats:
       scheme://host:port
       scheme://user:pass@host:port
       user:pass@host:port
       host:port
       host:port:user:pass
+      host port            (whitespace)
+      host port user pass  (whitespace)
     Schemes: http, https, socks4, socks5 (default: http).
     """
     s = line.strip()
@@ -331,11 +334,16 @@ def parse_proxy_line(line):
         else:
             user = creds
         s = hostpart
-    parts = s.split(":")
+    if any(c.isspace() for c in s):
+        parts = s.split()
+    else:
+        parts = s.split(":")
     if len(parts) == 2:
         host, port = parts
     elif len(parts) == 4 and user is None:
         host, port, user, pwd = parts
+    elif len(parts) == 3 and user is None:
+        host, port, user = parts
     else:
         return None
     try:

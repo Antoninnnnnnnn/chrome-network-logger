@@ -57,6 +57,8 @@ http://host:port
 https://user:pass@host:port
 socks5://host:port
 socks4://user:pass@host:port
+host port              (espace/tabulation)
+host port user pass    (espace/tabulation, ex. exports Decodo / Bright Data)
 ```
 
 Si des identifiants sont présents, une petite extension Chrome non packée est générée à la volée pour les fournir via `webRequest.onAuthRequired` (pas de pop-up d'auth).
