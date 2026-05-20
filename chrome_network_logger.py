@@ -760,6 +760,34 @@ def cleanup_locks(profile_dir):
 
             pass
 
+def fix_crash_exit_type(profile_dir):
+    """Patch Chrome Preferences so it doesn't think it crashed on last exit.
+    Without this, a forcibly-killed Chrome reopens in crash-recovery mode and
+    often exits immediately with no user interaction possible.
+    """
+    prefs_path = Path(profile_dir) / "Default" / "Preferences"
+    if not prefs_path.exists():
+        return
+    try:
+        prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+        profile_prefs = prefs.setdefault("profile", {})
+        changed = False
+        if profile_prefs.get("exit_type") not in (None, "Normal"):
+            profile_prefs["exit_type"] = "Normal"
+            changed = True
+        if profile_prefs.get("exited_cleanly") is not True:
+            profile_prefs["exited_cleanly"] = True
+            changed = True
+        sessions = prefs.get("sessions", {})
+        if sessions.get("crashed_session_restore"):
+            sessions["crashed_session_restore"] = False
+            changed = True
+        if changed:
+            prefs_path.write_text(json.dumps(prefs, ensure_ascii=False), encoding="utf-8")
+            print("[+] Preferences Chrome patchées (exit_type → Normal)")
+    except Exception as e:
+        print(f"[!] Patch Preferences: {e}")
+
 class CDPCapture:
 
     def __init__(self, full_dir, filtered_dir, debug_port, events_dirs=None):
@@ -1844,6 +1872,8 @@ def main():
 
     cleanup_locks(profile_dir)
 
+    fix_crash_exit_type(profile_dir)
+
     session_parent = prompt_session_subfolder()
 
     base, full_dir, filtered_dir, events_dirs = setup_session_dirs(session_parent)
@@ -1909,6 +1939,8 @@ def main():
         "--no-first-run",
 
         "--no-default-browser-check",
+
+        "--disable-session-crashed-bubble",
 
         "--disable-features=ChromeWhatsNewUI",
 
