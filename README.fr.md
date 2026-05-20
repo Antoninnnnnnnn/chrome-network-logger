@@ -91,4 +91,4 @@ MIT
 
 ---
 
-> 🤖 **Transparence totale :** Ce projet a été fait par [@Antonin2938](https://github.com/Antonin2938) qui avoue volontiers ne comprendre aucune ligne de ce code. Le vrai MVP ici, c'est le pair programming avec l'IA. Il s'avère qu'on n'a pas besoin de savoir coder pour livrer du code. Bienvenue en 2026.
+> 🤖 **Transparence totale :** Ce projet a été fait par [@Antoninnnnnnnn](https://github.com/Antoninnnnnnnn) qui avoue volontiers ne comprendre aucune ligne de ce code. Le vrai MVP ici, c'est le pair programming avec l'IA. Il s'avère qu'on n'a pas besoin de savoir coder pour livrer du code. Bienvenue en 2026.
