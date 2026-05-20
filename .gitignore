@@ -1,0 +1,14 @@
+# Captured sessions (contain plaintext passwords/cookies)
+session_*/
+capture_profile/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
