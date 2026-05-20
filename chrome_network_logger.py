@@ -1678,6 +1678,14 @@ class CDPCapture:
 
                 if self.running:
 
+                    err_str = str(e)
+
+                    win_aborted = "10053" in err_str or "10054" in err_str or "WinError" in err_str
+
+                    if win_aborted:
+
+                        break
+
                     print(f"[!] Erreur loop : {e}")
 
     def write_summary(self):
