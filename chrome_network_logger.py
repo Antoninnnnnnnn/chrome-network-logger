@@ -28,9 +28,13 @@ Usage :
   python chrome_logger_v2.py
 """
 
+import argparse
+
 import json
 
 import os
+
+import random
 
 import socket
 
@@ -354,18 +358,65 @@ def parse_proxy_line(line):
         scheme = "http"
     return {"scheme": scheme, "host": host, "port": port, "user": user, "pass": pwd}
 
-def load_proxy(path=PROXY_FILE):
+def load_all_proxies(path=PROXY_FILE):
     if not os.path.exists(path):
-        return None
+        return []
+    proxies = []
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
                 proxy = parse_proxy_line(line)
                 if proxy:
-                    return proxy
+                    proxies.append(proxy)
     except OSError as e:
         print(f"[!] Lecture {path} impossible: {e}")
-    return None
+    return proxies
+
+def _proxy_label(p):
+    user = (p.get("user") or "")[:2] + "***" if p.get("user") else "-"
+    return f"{p['scheme']}://{p['host']}:{p['port']}  user={user}"
+
+def select_proxy(proxies, cli_index=None, prompt=False):
+    """Return one proxy dict or None.
+    cli_index: int (1-based) or 'random' or 'none' or None.
+    prompt: ask interactively when True and cli_index is None.
+    Default (no arg, no flag): random among available proxies.
+    """
+    if not proxies:
+        return None
+    if cli_index == "none":
+        return None
+    if cli_index == "random" or cli_index is None:
+        if len(proxies) == 1 or not prompt:
+            chosen = random.choice(proxies)
+            if len(proxies) > 1:
+                print(f"[+] Proxy sélectionné (aléatoire) : {_proxy_label(chosen)}")
+            return chosen
+    if isinstance(cli_index, int):
+        idx = cli_index - 1
+        if 0 <= idx < len(proxies):
+            return proxies[idx]
+        print(f"[!] Proxy #{cli_index} introuvable ({len(proxies)} dispo). Aléatoire.")
+        return random.choice(proxies)
+    print("\n[?] Proxies disponibles :")
+    for i, p in enumerate(proxies, 1):
+        print(f"    {i}. {_proxy_label(p)}")
+    print(f"    0. Aucun (connexion directe)")
+    while True:
+        try:
+            raw = input(f"Choix [0-{len(proxies)}] (Entrée = aléatoire) : ").strip()
+            if raw == "":
+                chosen = random.choice(proxies)
+                print(f"[+] Proxy aléatoire : {_proxy_label(chosen)}")
+                return chosen
+            n = int(raw)
+            if n == 0:
+                return None
+            if 1 <= n <= len(proxies):
+                return proxies[n - 1]
+        except ValueError:
+            pass
+        print(f"  Entrer un nombre entre 0 et {len(proxies)}.")
 
 def build_proxy_auth_extension(proxy, ext_dir):
     """Build an MV2 unpacked extension that supplies proxy credentials."""
@@ -1600,6 +1651,48 @@ class CDPCapture:
 
 def main():
 
+    ap = argparse.ArgumentParser(
+        description="Chrome Network Logger — CDP stealth capture",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    ap.add_argument(
+        "--proxy",
+        metavar="N|random|none",
+        default=None,
+        help=(
+            "Proxy selection:\n"
+            "  --proxy random   pick one at random (default when proxy.txt has entries)\n"
+            "  --proxy none     disable proxy even if proxy.txt exists\n"
+            "  --proxy 2        use proxy #2 from proxy.txt\n"
+            "  (omit flag)      random if silent, or prompt with --proxy-prompt"
+        ),
+    )
+    ap.add_argument(
+        "--proxy-prompt",
+        action="store_true",
+        help="Prompt interactively to choose a proxy from proxy.txt",
+    )
+    ap.add_argument(
+        "--proxy-file",
+        metavar="FILE",
+        default=PROXY_FILE,
+        help=f"Path to proxy list file (default: {PROXY_FILE})",
+    )
+    cli = ap.parse_args()
+
+    proxy_cli_index = None
+    if cli.proxy is not None:
+        raw = cli.proxy.strip().lower()
+        if raw == "random":
+            proxy_cli_index = "random"
+        elif raw == "none":
+            proxy_cli_index = "none"
+        else:
+            try:
+                proxy_cli_index = int(raw)
+            except ValueError:
+                ap.error(f"--proxy doit être un entier, 'random' ou 'none' (reçu: {cli.proxy!r})")
+
     print("=" * 70)
 
     print("  Chrome Network Logger v2 - CDP direct (stealth)")
@@ -1720,13 +1813,16 @@ def main():
 
     ]
 
-    proxy = load_proxy()
+    proxies = load_all_proxies(cli.proxy_file)
+    proxy = select_proxy(proxies, cli_index=proxy_cli_index, prompt=cli.proxy_prompt)
     if proxy:
-        masked_user = (proxy.get("user") or "")[:2] + "***" if proxy.get("user") else "-"
-        print(f"[+] Proxy détecté ({proxy['scheme']}): {proxy['host']}:{proxy['port']} user={masked_user}")
+        print(f"[+] Proxy utilisé : {_proxy_label(proxy)}")
         args.extend(build_proxy_chrome_args(proxy, profile_dir))
     else:
-        print(f"[+] Aucun proxy ({PROXY_FILE} absent ou vide)")
+        if proxies:
+            print("[+] Proxy désactivé (--proxy none)")
+        else:
+            print(f"[+] Aucun proxy ({cli.proxy_file} absent ou vide)")
 
     print("[+] Lancement Chrome (détaché)...")
 

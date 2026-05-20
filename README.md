@@ -48,7 +48,7 @@ You'll be prompted for a session subfolder name (useful to group sessions per si
 
 ## 🌐 Proxy support
 
-Drop a `proxy.txt` file next to the script. The first non-empty line is parsed automatically. All these formats work:
+Drop a `proxy.txt` file next to the script. All these formats are auto-detected:
 
 ```
 host:port
@@ -62,9 +62,18 @@ host port              (space/tab-separated)
 host port user pass    (space/tab-separated, e.g. Decodo / Bright Data exports)
 ```
 
-If credentials are present, a tiny unpacked Chrome extension is generated on the fly to feed them to `webRequest.onAuthRequired` (no auth prompt).
+**Selection behaviour (multiple proxies):**
 
-No `proxy.txt`? Chrome runs with your direct connection.
+| Command | Behaviour |
+|---|---|
+| `python chrome_network_logger.py` | picks one **at random** |
+| `--proxy-prompt` | shows a numbered list, prompts you to choose |
+| `--proxy 2` | uses proxy #2 from the file |
+| `--proxy random` | explicit random (same as default) |
+| `--proxy none` | disables proxy even if `proxy.txt` exists |
+| `--proxy-file other.txt` | loads proxies from a different file |
+
+If credentials are present, a tiny unpacked Chrome extension is generated on the fly to feed them to `webRequest.onAuthRequired` (no auth prompt).
 
 ## 📁 Output layout
 

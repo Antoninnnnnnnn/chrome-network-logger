@@ -47,7 +47,7 @@ python chrome_network_logger.py
 Un sous-dossier de session te sera demandé (utile pour grouper par site).
 ## 🌐 Support proxy
 
-Dépose un fichier `proxy.txt` à côté du script. La première ligne non vide est parsée automatiquement. Tous ces formats fonctionnent :
+Dépose un fichier `proxy.txt` à côté du script. Tous ces formats sont détectés automatiquement :
 
 ```
 host:port
@@ -61,9 +61,18 @@ host port              (espace/tabulation)
 host port user pass    (espace/tabulation, ex. exports Decodo / Bright Data)
 ```
 
-Si des identifiants sont présents, une petite extension Chrome non packée est générée à la volée pour les fournir via `webRequest.onAuthRequired` (pas de pop-up d'auth).
+**Sélection (plusieurs proxies dans le fichier) :**
 
-Pas de `proxy.txt` ? Chrome se lance en connexion directe.
+| Commande | Comportement |
+|---|---|
+| `python chrome_network_logger.py` | choisit un proxy **aléatoirement** |
+| `--proxy-prompt` | affiche une liste numérotée et demande ton choix |
+| `--proxy 2` | utilise le proxy n°2 du fichier |
+| `--proxy random` | aléatoire explicite (même chose que par défaut) |
+| `--proxy none` | désactive le proxy même si `proxy.txt` existe |
+| `--proxy-file other.txt` | charge les proxies depuis un autre fichier |
+
+Si des identifiants sont présents, une petite extension Chrome non packée est générée à la volée via `webRequest.onAuthRequired` (pas de pop-up d'auth).
 ## 📁 Structure de sortie
 
 ```
