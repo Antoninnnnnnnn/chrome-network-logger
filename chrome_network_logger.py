@@ -30,6 +30,8 @@ Usage :
 
 import argparse
 
+import base64
+
 import json
 
 import os
@@ -418,49 +420,140 @@ def select_proxy(proxies, cli_index=None, prompt=False):
             pass
         print(f"  Entrer un nombre entre 0 et {len(proxies)}.")
 
-def build_proxy_auth_extension(proxy, ext_dir):
-    """Build an MV2 unpacked extension that supplies proxy credentials."""
-    ext_dir = Path(ext_dir)
-    ext_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "version": "1.0.0",
-        "manifest_version": 2,
-        "name": "Proxy Auth Helper",
-        "permissions": [
-            "proxy", "tabs", "unlimitedStorage", "storage",
-            "<all_urls>", "webRequest", "webRequestBlocking"
-        ],
-        "background": {"scripts": ["background.js"]},
-        "minimum_chrome_version": "22.0.0"
-    }
-    user = json.dumps(proxy.get("user") or "")
-    pwd = json.dumps(proxy.get("pass") or "")
-    background_js = (
-        "chrome.webRequest.onAuthRequired.addListener(\n"
-        "  function(details) {\n"
-        "    return { authCredentials: { username: " + user + ", password: " + pwd + " } };\n"
-        "  },\n"
-        "  { urls: ['<all_urls>'] },\n"
-        "  ['blocking']\n"
-        ");\n"
-    )
-    (ext_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    (ext_dir / "background.js").write_text(background_js, encoding="utf-8")
-    return str(ext_dir.absolute())
+def _make_proxy_auth_header(user, pwd):
+    token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+    return f"Basic {token}"
 
-def build_proxy_chrome_args(proxy, profile_dir):
-    """Return list of extra chrome args for the given proxy dict."""
+_active_relays: list = []
+
+class _LocalProxyRelay(threading.Thread):
+    """Minimal local HTTP/HTTPS relay that injects Proxy-Authorization into every
+    CONNECT tunnel and plain HTTP request so Chrome never sees a 407 popup."""
+
+    def __init__(self, upstream_host, upstream_port, auth_header):
+        super().__init__(daemon=True, name="ProxyRelay")
+        self._up_host = upstream_host
+        self._up_port = upstream_port
+        self._auth = auth_header
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self.local_port = self._srv.getsockname()[1]
+        self._srv.listen(256)
+
+    def run(self):
+        while True:
+            try:
+                client, _ = self._srv.accept()
+                threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+            except Exception:
+                break
+
+    def stop(self):
+        try:
+            self._srv.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _recv_headers(sock, limit=131072):
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > limit:
+                break
+        return buf
+
+    @staticmethod
+    def _tunnel(a, b):
+        def _fwd(src, dst):
+            try:
+                while True:
+                    d = src.recv(65536)
+                    if not d:
+                        break
+                    dst.sendall(d)
+            except Exception:
+                pass
+            finally:
+                for s in (src, dst):
+                    try:
+                        s.shutdown(socket.SHUT_WR)
+                    except Exception:
+                        pass
+        t = threading.Thread(target=_fwd, args=(b, a), daemon=True)
+        t.start()
+        _fwd(a, b)
+        t.join()
+
+    def _handle(self, client):
+        try:
+            raw = self._recv_headers(client)
+            if not raw or b"\r\n\r\n" not in raw:
+                return
+            sep = raw.index(b"\r\n\r\n")
+            headers_raw = raw[:sep]
+            leftover = raw[sep + 4:]
+            first_line, _, header_rest = headers_raw.partition(b"\r\n")
+            parts = first_line.split(b" ", 2)
+            method = parts[0].upper()
+            target = parts[1].decode("latin-1") if len(parts) > 1 else ""
+            up = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            up.connect((self._up_host, self._up_port))
+            if method == b"CONNECT":
+                up.sendall(
+                    f"CONNECT {target} HTTP/1.1\r\n"
+                    f"Host: {target}\r\n"
+                    f"Proxy-Authorization: {self._auth}\r\n"
+                    f"Proxy-Connection: keep-alive\r\n"
+                    f"\r\n".encode()
+                )
+                resp = self._recv_headers(up)
+                status_line = resp.split(b"\r\n")[0].decode("latin-1") if resp else ""
+                if "200" in status_line:
+                    client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    self._tunnel(client, up)
+                else:
+                    client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            else:
+                clean_lines = [
+                    l for l in header_rest.split(b"\r\n")
+                    if not l.lower().startswith(b"proxy-authorization:")
+                ]
+                clean_lines.append(f"Proxy-Authorization: {self._auth}".encode())
+                new_req = first_line + b"\r\n" + b"\r\n".join(clean_lines) + b"\r\n\r\n"
+                up.sendall(new_req)
+                if leftover:
+                    up.sendall(leftover)
+                self._tunnel(client, up)
+        except Exception:
+            pass
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+def build_proxy_chrome_args(proxy):
+    """Return Chrome CLI args for the given proxy dict. Starts relay thread if auth needed."""
     if not proxy:
         return []
     scheme = proxy["scheme"]
-    server = f"{scheme}://{proxy['host']}:{proxy['port']}"
-    args = [f"--proxy-server={server}"]
-    if proxy.get("user"):
-        ext_dir = Path(profile_dir) / "_proxy_auth_ext"
-        build_proxy_auth_extension(proxy, ext_dir)
-        args.append(f"--load-extension={ext_dir.absolute()}")
-        args.append("--disable-features=DisableLoadExtensionCommandLineSwitch")
-    return args
+    host = proxy["host"]
+    port = proxy["port"]
+    if proxy.get("user") and scheme in ("http", "https"):
+        auth = _make_proxy_auth_header(proxy["user"], proxy.get("pass") or "")
+        relay = _LocalProxyRelay(host, port, auth)
+        relay.start()
+        _active_relays.append(relay)
+        print(f"[+] Relay local port {relay.local_port} → {host}:{port} (auth injectée)")
+        return [f"--proxy-server=http://127.0.0.1:{relay.local_port}"]
+    else:
+        server = f"{scheme}://{host}:{port}"
+        return [f"--proxy-server={server}"]
 
 def find_free_port(start=9222):
 
@@ -1817,7 +1910,7 @@ def main():
     proxy = select_proxy(proxies, cli_index=proxy_cli_index, prompt=cli.proxy_prompt)
     if proxy:
         print(f"[+] Proxy utilisé : {_proxy_label(proxy)}")
-        args.extend(build_proxy_chrome_args(proxy, profile_dir))
+        args.extend(build_proxy_chrome_args(proxy))
     else:
         if proxies:
             print("[+] Proxy désactivé (--proxy none)")
