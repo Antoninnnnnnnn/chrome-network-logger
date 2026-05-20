@@ -437,12 +437,34 @@ class _LocalProxyRelay(threading.Thread):
         self._up_host = upstream_host
         self._up_port = upstream_port
         self._auth = auth_header
-        self.proxy_enabled = True
+        self._proxy_enabled = True
+        self._active_sockets: set = set()
+        self._sock_lock = threading.Lock()
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind(("127.0.0.1", 0))
         self.local_port = self._srv.getsockname()[1]
         self._srv.listen(256)
+
+    @property
+    def proxy_enabled(self):
+        return self._proxy_enabled
+
+    @proxy_enabled.setter
+    def proxy_enabled(self, value):
+        if bool(value) != self._proxy_enabled:
+            self._proxy_enabled = bool(value)
+            with self._sock_lock:
+                for s in list(self._active_sockets):
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                self._active_sockets.clear()
 
     def run(self):
         while True:
@@ -493,6 +515,10 @@ class _LocalProxyRelay(threading.Thread):
         t.join()
 
     def _handle(self, client):
+        up = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with self._sock_lock:
+            self._active_sockets.add(up)
+            self._active_sockets.add(client)
         try:
             raw = self._recv_headers(client)
             if not raw or b"\r\n\r\n" not in raw:
@@ -568,6 +594,9 @@ class _LocalProxyRelay(threading.Thread):
         except Exception:
             pass
         finally:
+            with self._sock_lock:
+                self._active_sockets.discard(up)
+                self._active_sockets.discard(client)
             try:
                 client.close()
             except Exception:
