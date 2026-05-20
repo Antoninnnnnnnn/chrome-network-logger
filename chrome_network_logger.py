@@ -78,6 +78,8 @@ CHROME_PATHS = [
 
 DEDICATED_PROFILE_DIR = str(Path.cwd() / "capture_profile")
 
+PROXY_FILE = str(Path.cwd() / "proxy.txt")
+
 FILTERED_TYPES = {"XHR", "Fetch", "Document", "WebSocket", "EventSource"}
 
 import secrets as _secrets
@@ -303,6 +305,103 @@ def find_chrome():
     print("[!] Chrome introuvable.")
 
     sys.exit(1)
+
+def parse_proxy_line(line):
+    """Auto-detect proxy format. Returns dict or None.
+    Supported:
+      scheme://host:port
+      scheme://user:pass@host:port
+      user:pass@host:port
+      host:port
+      host:port:user:pass
+    Schemes: http, https, socks4, socks5 (default: http).
+    """
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return None
+    scheme = "http"
+    if "://" in s:
+        scheme, _, s = s.partition("://")
+        scheme = scheme.lower()
+    user = pwd = None
+    if "@" in s:
+        creds, _, hostpart = s.rpartition("@")
+        if ":" in creds:
+            user, _, pwd = creds.partition(":")
+        else:
+            user = creds
+        s = hostpart
+    parts = s.split(":")
+    if len(parts) == 2:
+        host, port = parts
+    elif len(parts) == 4 and user is None:
+        host, port, user, pwd = parts
+    else:
+        return None
+    try:
+        port = int(port)
+    except ValueError:
+        return None
+    if scheme not in ("http", "https", "socks4", "socks5"):
+        scheme = "http"
+    return {"scheme": scheme, "host": host, "port": port, "user": user, "pass": pwd}
+
+def load_proxy(path=PROXY_FILE):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                proxy = parse_proxy_line(line)
+                if proxy:
+                    return proxy
+    except OSError as e:
+        print(f"[!] Lecture {path} impossible: {e}")
+    return None
+
+def build_proxy_auth_extension(proxy, ext_dir):
+    """Build an MV2 unpacked extension that supplies proxy credentials."""
+    ext_dir = Path(ext_dir)
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "version": "1.0.0",
+        "manifest_version": 2,
+        "name": "Proxy Auth Helper",
+        "permissions": [
+            "proxy", "tabs", "unlimitedStorage", "storage",
+            "<all_urls>", "webRequest", "webRequestBlocking"
+        ],
+        "background": {"scripts": ["background.js"]},
+        "minimum_chrome_version": "22.0.0"
+    }
+    user = json.dumps(proxy.get("user") or "")
+    pwd = json.dumps(proxy.get("pass") or "")
+    background_js = (
+        "chrome.webRequest.onAuthRequired.addListener(\n"
+        "  function(details) {\n"
+        "    return { authCredentials: { username: " + user + ", password: " + pwd + " } };\n"
+        "  },\n"
+        "  { urls: ['<all_urls>'] },\n"
+        "  ['blocking']\n"
+        ");\n"
+    )
+    (ext_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (ext_dir / "background.js").write_text(background_js, encoding="utf-8")
+    return str(ext_dir.absolute())
+
+def build_proxy_chrome_args(proxy, profile_dir):
+    """Return list of extra chrome args for the given proxy dict."""
+    if not proxy:
+        return []
+    scheme = proxy["scheme"]
+    server = f"{scheme}://{proxy['host']}:{proxy['port']}"
+    args = [f"--proxy-server={server}"]
+    if proxy.get("user"):
+        ext_dir = Path(profile_dir) / "_proxy_auth_ext"
+        build_proxy_auth_extension(proxy, ext_dir)
+        args.append(f"--load-extension={ext_dir.absolute()}")
+        args.append("--disable-features=DisableLoadExtensionCommandLineSwitch")
+    return args
 
 def find_free_port(start=9222):
 
@@ -1612,6 +1711,14 @@ def main():
         "--disable-features=ChromeWhatsNewUI",
 
     ]
+
+    proxy = load_proxy()
+    if proxy:
+        masked_user = (proxy.get("user") or "")[:2] + "***" if proxy.get("user") else "-"
+        print(f"[+] Proxy détecté ({proxy['scheme']}): {proxy['host']}:{proxy['port']} user={masked_user}")
+        args.extend(build_proxy_chrome_args(proxy, profile_dir))
+    else:
+        print(f"[+] Aucun proxy ({PROXY_FILE} absent ou vide)")
 
     print("[+] Lancement Chrome (détaché)...")
 

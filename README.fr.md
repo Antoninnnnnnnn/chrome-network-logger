@@ -45,7 +45,23 @@ python chrome_network_logger.py
 **Lancements suivants** : ton profil + cookies/sessions sont réutilisés tels quels.
 
 Un sous-dossier de session te sera demandé (utile pour grouper par site).
+## 🌐 Support proxy
 
+Dépose un fichier `proxy.txt` à côté du script. La première ligne non vide est parsée automatiquement. Tous ces formats fonctionnent :
+
+```
+host:port
+host:port:user:pass
+user:pass@host:port
+http://host:port
+https://user:pass@host:port
+socks5://host:port
+socks4://user:pass@host:port
+```
+
+Si des identifiants sont présents, une petite extension Chrome non packée est générée à la volée pour les fournir via `webRequest.onAuthRequired` (pas de pop-up d'auth).
+
+Pas de `proxy.txt` ? Chrome se lance en connexion directe.
 ## 📁 Structure de sortie
 
 ```

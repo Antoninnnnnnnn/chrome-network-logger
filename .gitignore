@@ -2,6 +2,9 @@
 session_*/
 capture_profile/
 
+# Proxy credentials
+proxy.txt
+
 # Python
 __pycache__/
 *.pyc

@@ -46,6 +46,24 @@ python chrome_network_logger.py
 
 You'll be prompted for a session subfolder name (useful to group sessions per site).
 
+## 🌐 Proxy support
+
+Drop a `proxy.txt` file next to the script. The first non-empty line is parsed automatically. All these formats work:
+
+```
+host:port
+host:port:user:pass
+user:pass@host:port
+http://host:port
+https://user:pass@host:port
+socks5://host:port
+socks4://user:pass@host:port
+```
+
+If credentials are present, a tiny unpacked Chrome extension is generated on the fly to feed them to `webRequest.onAuthRequired` (no auth prompt).
+
+No `proxy.txt`? Chrome runs with your direct connection.
+
 ## 📁 Output layout
 
 ```
