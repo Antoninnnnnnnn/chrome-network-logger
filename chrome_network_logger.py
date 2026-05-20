@@ -428,13 +428,16 @@ _active_relays: list = []
 
 class _LocalProxyRelay(threading.Thread):
     """Minimal local HTTP/HTTPS relay that injects Proxy-Authorization into every
-    CONNECT tunnel and plain HTTP request so Chrome never sees a 407 popup."""
+    CONNECT tunnel and plain HTTP request so Chrome never sees a 407 popup.
+    proxy_enabled can be toggled at runtime to switch between upstream proxy
+    and direct connection without restarting Chrome."""
 
     def __init__(self, upstream_host, upstream_port, auth_header):
         super().__init__(daemon=True, name="ProxyRelay")
         self._up_host = upstream_host
         self._up_port = upstream_port
         self._auth = auth_header
+        self.proxy_enabled = True
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._srv.bind(("127.0.0.1", 0))
@@ -502,33 +505,66 @@ class _LocalProxyRelay(threading.Thread):
             method = parts[0].upper()
             target = parts[1].decode("latin-1") if len(parts) > 1 else ""
             up = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            up.connect((self._up_host, self._up_port))
             if method == b"CONNECT":
-                up.sendall(
-                    f"CONNECT {target} HTTP/1.1\r\n"
-                    f"Host: {target}\r\n"
-                    f"Proxy-Authorization: {self._auth}\r\n"
-                    f"Proxy-Connection: keep-alive\r\n"
-                    f"\r\n".encode()
-                )
-                resp = self._recv_headers(up)
-                status_line = resp.split(b"\r\n")[0].decode("latin-1") if resp else ""
-                if "200" in status_line:
+                if self.proxy_enabled:
+                    up.connect((self._up_host, self._up_port))
+                    auth_line = f"Proxy-Authorization: {self._auth}\r\n" if self._auth else ""
+                    up.sendall(
+                        f"CONNECT {target} HTTP/1.1\r\n"
+                        f"Host: {target}\r\n"
+                        f"{auth_line}"
+                        f"Proxy-Connection: keep-alive\r\n"
+                        f"\r\n".encode()
+                    )
+                    resp = self._recv_headers(up)
+                    status_line = resp.split(b"\r\n")[0].decode("latin-1") if resp else ""
+                    if "200" in status_line:
+                        client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        self._tunnel(client, up)
+                    else:
+                        client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                else:
+                    dhost, _, dport_s = target.rpartition(":")
+                    up.connect((dhost, int(dport_s)))
                     client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
                     self._tunnel(client, up)
-                else:
-                    client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             else:
-                clean_lines = [
-                    l for l in header_rest.split(b"\r\n")
-                    if not l.lower().startswith(b"proxy-authorization:")
-                ]
-                clean_lines.append(f"Proxy-Authorization: {self._auth}".encode())
-                new_req = first_line + b"\r\n" + b"\r\n".join(clean_lines) + b"\r\n\r\n"
-                up.sendall(new_req)
-                if leftover:
-                    up.sendall(leftover)
-                self._tunnel(client, up)
+                if self.proxy_enabled:
+                    clean_lines = [
+                        l for l in header_rest.split(b"\r\n")
+                        if not l.lower().startswith(b"proxy-authorization:")
+                    ]
+                    if self._auth:
+                        clean_lines.append(f"Proxy-Authorization: {self._auth}".encode())
+                    new_req = first_line + b"\r\n" + b"\r\n".join(clean_lines) + b"\r\n\r\n"
+                    up.connect((self._up_host, self._up_port))
+                    up.sendall(new_req)
+                    if leftover:
+                        up.sendall(leftover)
+                    self._tunnel(client, up)
+                else:
+                    url_str = target
+                    if url_str.startswith("http://"):
+                        url_str = url_str[7:]
+                    host_part, _, path_part = url_str.partition("/")
+                    path = "/" + path_part
+                    if ":" in host_part:
+                        dhost, _, dport_s = host_part.rpartition(":")
+                        dport = int(dport_s)
+                    else:
+                        dhost, dport = host_part, 80
+                    clean_lines = [
+                        l for l in header_rest.split(b"\r\n")
+                        if not l.lower().startswith(b"proxy-authorization:")
+                        and not l.lower().startswith(b"proxy-connection:")
+                    ]
+                    new_first = parts[0] + b" " + path.encode() + b" HTTP/1.1"
+                    new_req = new_first + b"\r\n" + b"\r\n".join(clean_lines) + b"\r\n\r\n"
+                    up.connect((dhost, dport))
+                    up.sendall(new_req)
+                    if leftover:
+                        up.sendall(leftover)
+                    self._tunnel(client, up)
         except Exception:
             pass
         finally:
@@ -544,16 +580,51 @@ def build_proxy_chrome_args(proxy):
     scheme = proxy["scheme"]
     host = proxy["host"]
     port = proxy["port"]
-    if proxy.get("user") and scheme in ("http", "https"):
-        auth = _make_proxy_auth_header(proxy["user"], proxy.get("pass") or "")
+    if scheme in ("http", "https"):
+        auth = _make_proxy_auth_header(proxy["user"], proxy.get("pass") or "") if proxy.get("user") else None
         relay = _LocalProxyRelay(host, port, auth)
         relay.start()
         _active_relays.append(relay)
-        print(f"[+] Relay local port {relay.local_port} → {host}:{port} (auth injectée)")
+        suffix = " (auth injectée)" if auth else ""
+        print(f"[+] Relay local port {relay.local_port} → {host}:{port}{suffix} — [P] pour toggle")
         return [f"--proxy-server=http://127.0.0.1:{relay.local_port}"]
     else:
         server = f"{scheme}://{host}:{port}"
         return [f"--proxy-server={server}"]
+
+def _start_proxy_keyboard_thread(relay, toggle_log_path, stop_event):
+    """Background thread: press P to toggle proxy on/off while capture is running."""
+    try:
+        import msvcrt
+    except ImportError:
+        return
+    def _loop():
+        while not stop_event.is_set():
+            try:
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    if key in (b"p", b"P"):
+                        relay.proxy_enabled = not relay.proxy_enabled
+                        state = "enabled" if relay.proxy_enabled else "disabled"
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        label = "\u2705 PROXY ON" if relay.proxy_enabled else "\u274c PROXY OFF (connexion directe)"
+                        print(f"\n[{ts}] [PROXY TOGGLE] {label} ({relay._up_host}:{relay._up_port})")
+                        try:
+                            with open(toggle_log_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps({
+                                    "type": "proxy_toggle",
+                                    "ts": datetime.now().isoformat(),
+                                    "state": state,
+                                    "proxy": f"{relay._up_host}:{relay._up_port}",
+                                }) + "\n")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            time.sleep(0.05)
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
 
 def find_free_port(start=9222):
 
@@ -2020,6 +2091,14 @@ def main():
     cap_thread = threading.Thread(target=capture.loop, daemon=True)
 
     cap_thread.start()
+
+    _kb_stop = threading.Event()
+    if _active_relays:
+        _relay = _active_relays[0]
+        toggle_log = base / "proxy_toggles.jsonl"
+        _start_proxy_keyboard_thread(_relay, toggle_log, _kb_stop)
+        print("[+] Proxy toggle actif — appuie sur [P] pour activer/désactiver le proxy en live")
+        print()
 
     def shutdown(*_):
 
