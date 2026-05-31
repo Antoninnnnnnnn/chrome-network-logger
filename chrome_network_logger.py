@@ -1301,7 +1301,75 @@ class CDPCapture:
 
             req_url = params.get("request", {}).get("url", "")
 
+            redirect_response = params.get("redirectResponse")
+
             with self.lock:
+
+                # ── Hop de redirection (301/302/303/307/308) ──
+                # CDP RÉUTILISE le même requestId pour la requête qui suit une
+                # redirection : la réponse du hop redirigé arrive ICI, dans
+                # `redirectResponse`, et n'aura JAMAIS son propre
+                # responseReceived/loadingFinished. Sans ce bloc, l'entrée du
+                # hop (ex: le cross-origin enter.asp qui pose le cookie d'auth)
+                # serait simplement écrasée ci-dessous, puis perdue.
+                # On l'archive d'abord, Set-Cookie inclus.
+                prev_redirect_chain = []
+
+                if redirect_response is not None and req_id in self.requests_data:
+
+                    prev = self.requests_data[req_id]
+
+                    prev["response"] = dict(redirect_response)
+
+                    prev["type"] = params.get("type", prev.get("type"))
+
+                    prev["is_redirect"] = True
+
+                    prev["redirect_to"] = req_url
+
+                    prev_redirect_chain = list(prev.get("redirect_chain") or [])
+
+                    prev_redirect_chain.append(redirect_response.get("url"))
+
+                    # Fusionne les Set-Cookie du hop (souvent fournis uniquement
+                    # via responseReceivedExtraInfo, pas dans redirectResponse.headers).
+                    extra = self.extra_info.pop(req_id, None)
+
+                    if extra:
+
+                        prev["_extra_info"] = extra
+
+                        set_cookies = extra.get("response_set_cookie")
+
+                        if set_cookies:
+
+                            headers = dict(prev["response"].get("headers", {}))
+
+                            headers.update(set_cookies)
+
+                            prev["response"]["headers"] = headers
+
+                            prev["response"]["_extraInfo_cookies"] = set_cookies
+
+                        cookies_sent = extra.get("request_cookie_header")
+
+                        if cookies_sent:
+
+                            req_h = prev.setdefault("request", {}).setdefault("headers", {})
+
+                            req_h.update(cookies_sent)
+
+                    self.stats["responses"] += 1
+
+                    redir_status = redirect_response.get("status", "?")
+
+                    redir_url = redirect_response.get("url", "")
+
+                    redir_cookies = list(prev["response"].get("_extraInfo_cookies", {}).keys())
+
+                    print(f"[REDIR {redir_status:>7}] {redir_url[:80]} -> {req_url[:60]} cookies={redir_cookies}")
+
+                    self._write_entry(prev)
 
                 self.requests_data[req_id] = {
 
@@ -1323,6 +1391,8 @@ class CDPCapture:
 
                     "frameId": params.get("frameId"),
 
+                    "redirect_chain": prev_redirect_chain or None,
+
                 }
 
                 self.stats["requests"] += 1
@@ -1331,7 +1401,9 @@ class CDPCapture:
 
             typ = params.get("type", "?")
 
-            print(f"[REQ {typ:>10}] {method_str:6} {req_url[:100]}")
+            redir_tag = " (after redirect)" if redirect_response is not None else ""
+
+            print(f"[REQ {typ:>10}] {method_str:6} {req_url[:100]}{redir_tag}")
 
         elif method == "Network.responseReceived":
 
