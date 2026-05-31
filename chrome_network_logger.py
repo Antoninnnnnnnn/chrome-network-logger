@@ -894,6 +894,14 @@ class CDPCapture:
 
         self.pending_body_requests = {}
 
+        # Corps de réponse récupérés via Fetch au stade Response (fiable pour
+        # les navigations Document souvent évincées avant getResponseBody).
+        self.pending_fetch_bodies = {}
+
+        # networkId dont le corps a déjà été capturé via Fetch → ne pas
+        # re-tenter Network.getResponseBody sur loadingFinished.
+        self.fetch_body_captured = set()
+
         self.pending_cookie_dumps = {}                   
 
         self.extra_info = {}                                   
@@ -1062,6 +1070,12 @@ class CDPCapture:
 
                 {"urlPattern": "*", "requestStage": "Request"},
 
+                {"urlPattern": "*", "requestStage": "Response", "resourceType": "Document"},
+
+                {"urlPattern": "*", "requestStage": "Response", "resourceType": "XHR"},
+
+                {"urlPattern": "*", "requestStage": "Response", "resourceType": "Fetch"},
+
             ],
 
             "handleAuthRequests": False,
@@ -1126,6 +1140,12 @@ class CDPCapture:
 
                 {"urlPattern": "*", "requestStage": "Request"},
 
+                {"urlPattern": "*", "requestStage": "Response", "resourceType": "Document"},
+
+                {"urlPattern": "*", "requestStage": "Response", "resourceType": "XHR"},
+
+                {"urlPattern": "*", "requestStage": "Response", "resourceType": "Fetch"},
+
             ],
 
             "handleAuthRequests": False,
@@ -1155,6 +1175,31 @@ class CDPCapture:
             fetch_req_id = params["requestId"]
 
             network_id = params.get("networkId", "")
+
+            # ── Stade Response : capturer le corps de façon fiable ──
+            # (params contient responseStatusCode/responseHeaders à ce stade).
+            # Indispensable pour les navigations Document (POST 3DS, confirmation)
+            # dont le corps serait sinon évincé avant Network.getResponseBody.
+            if "responseStatusCode" in params or "responseErrorReason" in params:
+
+                if params.get("responseErrorReason"):
+
+                    # Échec réseau : laisser passer sans corps (ne pas bloquer la page)
+                    try:
+
+                        self.send("Fetch.continueResponse", {"requestId": fetch_req_id}, session_id=session_id)
+
+                    except Exception:
+
+                        pass
+
+                    return
+
+                body_msg_id = self.send("Fetch.getResponseBody", {"requestId": fetch_req_id}, session_id=session_id)
+
+                self.pending_fetch_bodies[body_msg_id] = (network_id, fetch_req_id, session_id)
+
+                return
 
             request = params.get("request", {})
 
@@ -1323,6 +1368,18 @@ class CDPCapture:
                 else:
 
                     return
+
+            # Corps déjà récupéré via Fetch (stade Response) → finaliser sans
+            # re-tenter (Network.getResponseBody échouerait sur une navigation).
+            if req_id in self.fetch_body_captured:
+
+                self.fetch_body_captured.discard(req_id)
+
+                with self.lock:
+
+                    self._finalize(req_id)
+
+                return
 
             body_msg_id = self.send("Network.getResponseBody",
 
@@ -1659,6 +1716,39 @@ class CDPCapture:
                         req_h = self.requests_data[req_id].get("request", {}).get("headers", {})
 
                         req_h.update(cookies_sent)
+
+        elif "id" in msg and msg["id"] in self.pending_fetch_bodies:
+
+            network_id, fetch_req_id, sess = self.pending_fetch_bodies.pop(msg["id"])
+
+            result = msg.get("result", {})
+
+            body = result.get("body")
+
+            with self.lock:
+
+                target = self.requests_data.get(network_id)
+
+                if target is not None and body is not None:
+
+                    target["responseBody"] = body
+
+                    target["responseBodyBase64"] = result.get("base64Encoded", False)
+
+                    if network_id:
+
+                        self.fetch_body_captured.add(network_id)
+
+                    self.stats["bodies"] += 1
+
+            # TOUJOURS relancer la réponse, sinon la page reste bloquée.
+            try:
+
+                self.send("Fetch.continueResponse", {"requestId": fetch_req_id}, session_id=sess)
+
+            except Exception:
+
+                pass
 
         elif "id" in msg and msg["id"] in self.pending_body_requests:
 
