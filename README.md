@@ -2,122 +2,115 @@
 
 [🇫🇷 Version française](README.fr.md)
 
-A standalone, **dependency-light** Python script that captures **everything** happening inside a Chrome browser via the Chrome DevTools Protocol (CDP) — no Selenium, no Playwright. It uses a dedicated, isolated Chrome profile so your main browser is never touched.
+A dependency-light Python toolkit for capturing **application-layer Chrome traffic** through the Chrome DevTools Protocol (CDP), without Selenium or Playwright. It uses a dedicated Chrome profile so your normal browser profile is not touched.
 
-## ✨ What it captures
+The repository now has two entry points:
 
-| Category | Details |
-|---|---|
-| **HTTP requests** | URL, method, headers, `postData` (POST/PUT/form bodies) |
-| **HTTP responses** | Status, headers, **full body** (JSON, HTML, images, binary…) |
-| **Cookies** | Real `Set-Cookie` headers via `ExtraInfo`, outgoing `Cookie` headers, full cookie dump after login |
-| **WebSocket** | Frames sent **and** received, opcode/binary flag, handshake request/response (cookies on upgrade), frame errors |
-| **Server-Sent Events** | All SSE messages with event name & data |
-| **User interactions** | Every `click`, `change` (checkboxes, radios, selects, dates), `input` (typed text including emails & passwords), special keys (`Enter`, `Tab`, `Esc`, Ctrl/Meta combos), `paste` & `copy` (clipboard content), `focus`, SPA navigation (`popstate`, `hashchange`, `beforeunload`) |
-| **Form submits** | Full `FormData` serialized (login forms, etc.) |
-| **JS errors & console** | All `console.log/warn/error`, uncaught exceptions |
-| **Multi-tab / workers** | Auto-attach to new tabs, iframes, popups (recursive), workers and service workers |
-| **Navigation events** | `Page.frameNavigated` for accurate timeline |
+- `chrome_network_logger.py` — general/full capture with user interactions.
+- `api_network_logger.py` — **recommended for API analysis**: cleaner output, stronger multi-tab handling, richer request/response metadata and shutdown snapshots.
 
-## 🥷 Stealth
-
-- Dedicated Chrome profile (no interference with your main browser)
-- User interactions go through a CDP **binding** with a random name (re-generated each run), not `console.log` → not detectable by classic anti-bot scripts that monitor the console
-- The binding name is removed from `window` immediately after install
-- `FORM_INTERCEPT_JS` also uses the binding (no `console.log` markers)
-
-## 📦 Install
+## API analysis mode
 
 ```bash
 pip install websocket-client psutil
+python api_network_logger.py
 ```
 
-Chrome must be installed at one of the default Windows paths (the script auto-detects).
+The API mode reuses the same `capture_profile` and proxy helpers as the main logger.
 
-## 🚀 Usage
+### What the API mode captures
+
+| Category | Details |
+|---|---|
+| **HTTP(S)** | URL, method, normal headers, CDP `ExtraInfo` headers, initiator, target/tab context |
+| **Request bodies** | `postData` plus `Network.getRequestPostData` fallback when Chrome omits it from the event |
+| **Responses** | Status, headers, body, protocol/timing/cache/service-worker/security fields exposed by CDP |
+| **Failures** | Network errors, blocked reason, cancellation and CORS error status |
+| **Redirects** | Every redirect hop is preserved instead of being overwritten by the next request |
+| **Cookies** | Sent/received cookie information plus a final full browser cookie snapshot |
+| **Storage** | Final `localStorage` and `sessionStorage` snapshots for attached pages |
+| **WebSocket** | Handshake plus frames sent/received and frame errors |
+| **SSE / EventSource** | Messages with event name, ID and data |
+| **WebTransport** | Creation / connection / close lifecycle; CDP does not expose stream/datagram payloads through these Network events |
+| **Tabs / workers** | Browser-level CDP target discovery for independent tabs/popups, then recursive attachment to iframes/workers/service workers |
+| **Console errors** | Exceptions and warning/error/assert console messages, kept separately from network logs |
+
+The `api/requests.jsonl` view keeps XHR, Fetch, Document, WebSocket, EventSource, Ping/beacon-like requests, write methods and CORS preflights. `full/requests.jsonl` retains the broader CDP request stream.
+
+## Important reliability changes in API mode
+
+- Request IDs are namespaced by CDP session, avoiding collisions between tabs/workers.
+- Response bodies use larger buffers and CDP durable-message storage when supported.
+- API-relevant response interception is limited to `Document`, `XHR` and `Fetch`; the logger no longer pauses every static asset just to inspect its request.
+- Open WebSockets, SSE streams and in-flight requests are flushed on shutdown instead of silently disappearing.
+- Body-capture failures are written as errors in the entry instead of looking like successful empty bodies.
+- `requestWillBeSentExtraInfo` / `responseReceivedExtraInfo` data is preserved, including blocked cookies and client security state.
+
+## Output
+
+```text
+session_api_YYYYMMDD_HHMMSS/
+├── full/
+│   ├── requests.jsonl
+│   └── summary.txt
+├── api/
+│   ├── requests.jsonl
+│   ├── summary.txt
+│   └── webtransport.jsonl        # only created when used
+└── meta/
+    ├── cookies_shutdown.json
+    ├── storage_shutdown.jsonl
+    └── console_errors.jsonl      # only created when relevant
+```
+
+## General capture mode
 
 ```bash
 python chrome_network_logger.py
 ```
 
-**First run**: the script creates an empty profile under `./capture_profile/`. Chrome opens, you log in to your target site, configure cookies, etc. Press `Ctrl+C` to save.
+The original mode is still useful when you want the network capture **plus a detailed user-interaction timeline** (clicks, input/change, forms, navigation, etc.).
 
-**Subsequent runs**: your profile + cookies/sessions are reused as-is.
+## Proxy support
 
-You'll be prompted for a session subfolder name (useful to group sessions per site).
+Drop a `proxy.txt` next to the scripts. Supported input formats include:
 
-## 🌐 Proxy support
-
-Drop a `proxy.txt` file next to the script. All these formats are auto-detected:
-
-```
+```text
 host:port
 host:port:user:pass
 user:pass@host:port
 http://host:port
 https://user:pass@host:port
 socks5://host:port
-socks4://user:pass@host:port
-host port              (space/tab-separated)
-host port user pass    (space/tab-separated, e.g. Decodo / Bright Data exports)
+host port user pass
 ```
 
-**Selection behaviour (multiple proxies):**
+Useful options:
 
-| Command | Behaviour |
-|---|---|
-| `python chrome_network_logger.py` | picks one **at random** |
-| `--proxy-prompt` | shows a numbered list, prompts you to choose |
-| `--proxy 2` | uses proxy #2 from the file |
-| `--proxy random` | explicit random (same as default) |
-| `--proxy none` | disables proxy even if `proxy.txt` exists |
-| `--proxy-file other.txt` | loads proxies from a different file |
-
-If credentials are present, a tiny unpacked Chrome extension is generated on the fly to feed them to `webRequest.onAuthRequired` (no auth prompt).
-
-## 📁 Output layout
-
-```
-session_YYYYMMDD_HHMMSS/
-├── README.txt                     # Auto-generated description
-├── full/
-│   ├── requests.jsonl             # EVERYTHING (CSS, fonts, images, XHR, WS…)
-│   └── summary.txt                # Human-readable summary
-├── filtered/
-│   ├── requests.jsonl             # Only XHR/Fetch/Document/WebSocket/EventSource
-│   └── summary.txt
-├── events/
-│   ├── full/events.jsonl          # All user interactions with FULL detail
-│   │                              # (cssPath, xpath, attrs, outerHTML, value…)
-│   └── summary/
-│       ├── events.jsonl           # Slim version (event/ts/url/outerHTML)
-│       └── events.html            # Browsable HTML view
-├── form_submit_captured.json      # All submitted forms (FormData incl. password)
-└── cookies_<label>.json           # Cookie dumps (auto post-login + manual)
+```bash
+python api_network_logger.py --proxy random
+python api_network_logger.py --proxy 2
+python api_network_logger.py --proxy none
+python api_network_logger.py --proxy-prompt
+python api_network_logger.py --proxy-file other.txt
 ```
 
-## ⚠️ Security & Legal Notice
+## Scope and limitations
 
-This tool captures **plaintext passwords, tokens, session cookies, and any text you type or paste**. It is intended for:
+This is a **CDP application-layer logger**, not a packet sniffer. It intentionally does not mix raw DNS/TCP/TLS/QUIC packets into the API logs. WebRTC media/DataChannel payloads are also outside this capture path.
 
-- Debugging your own web applications
-- Reverse-engineering APIs you have permission to access
-- Security research on your own systems
+CDP itself also has limits: `Network.getRequestPostData` omits uploaded file bytes from multipart requests, very large/streaming resources can still be unavailable, and WebTransport Network events expose lifecycle rather than stream/datagram payloads.
 
-**Do not** use it on services you don't own or don't have explicit permission to inspect. Store the `session_*` folders on encrypted storage and never commit them to a public repo.
+For API reconstruction this is usually preferable to packet-level capture because HTTPS request/response content is available after Chrome has decrypted it.
 
-## 🛠️ How it works
+## Security & legal notice
 
-1. Launches Chrome with `--remote-debugging-port=<free>` pointing at the dedicated profile
-2. Connects to CDP over WebSocket
-3. Enables: `Network`, `Page`, `Runtime`, `Fetch` (intercepts all URLs to grab `postData` on form navigations), `Target` (auto-attach to new tabs/workers)
-4. Registers a `Runtime.addBinding` and injects JS to forward user interactions via that binding
-5. Listens to all CDP events, writes one entry per request to JSONL
+Captures can contain **passwords, bearer tokens, API keys, session cookies and storage tokens**. Use the tool only on applications/systems you own or are authorized to inspect. Keep capture folders private and never commit them to a public repository.
 
-## 📜 License
+## License
 
 MIT
 
 ---
 
-> 🤖 **Full disclosure:** This project was built by [@Antoninnnnnnnn](https://github.com/Antoninnnnnnnn) who freely admits he doesn't understand a single line of this code. The real MVP here is AI pair programming. Turns out you don't need to know how to code to ship code. Welcome to 2026.
+> 🤖 **Full disclosure:** This project was built by [@Antoninnnnnnnn](https://github.com/Antoninnnnnnnn) with heavy AI pair-programming assistance.
