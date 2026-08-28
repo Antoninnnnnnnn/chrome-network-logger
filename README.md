@@ -1,123 +1,185 @@
-# Chrome Network Logger
+# Chrome Network Logger v3
 
 [🇫🇷 Version française](README.fr.md)
 
-A standalone, **dependency-light** Python script that captures **everything** happening inside a Chrome browser via the Chrome DevTools Protocol (CDP) — no Selenium, no Playwright. It uses a dedicated, isolated Chrome profile so your main browser is never touched.
+Python toolkit for capturing **Chrome application-layer traffic** through the Chrome DevTools Protocol (CDP), without Selenium or Playwright. It launches a dedicated Chrome profile, connects to the **browser target**, and attaches each tab, popup, iframe and worker through its own CDP session.
 
-## ✨ What it captures
+> This is not a packet sniffer. Raw DNS/TCP/TLS/QUIC and WebRTC media/DataChannel payloads are outside CDP; multipart bytes are available only when Chrome exposes them explicitly.
 
-| Category | Details |
-|---|---|
-| **HTTP requests** | URL, method, headers, `postData` (POST/PUT/form bodies) |
-| **HTTP responses** | Status, headers, **full body** (JSON, HTML, images, binary…) |
-| **Cookies** | Real `Set-Cookie` headers via `ExtraInfo`, outgoing `Cookie` headers, full cookie dump after login |
-| **WebSocket** | Frames sent **and** received, opcode/binary flag, handshake request/response (cookies on upgrade), frame errors |
-| **Server-Sent Events** | All SSE messages with event name & data |
-| **User interactions** | Every `click`, `change` (checkboxes, radios, selects, dates), `input` (typed text including emails & passwords), special keys (`Enter`, `Tab`, `Esc`, Ctrl/Meta combos), `paste` & `copy` (clipboard content), `focus`, SPA navigation (`popstate`, `hashchange`, `beforeunload`) |
-| **Form submits** | Full `FormData` serialized (login forms, etc.) |
-| **JS errors & console** | All `console.log/warn/error`, uncaught exceptions |
-| **Multi-tab / workers** | Auto-attach to new tabs, iframes, popups (recursive), workers and service workers |
-| **Navigation events** | `Page.frameNavigated` for accurate timeline |
+## What changed in v3
 
-## 🥷 Stealth
+- One entry point: `python chrome_network_logger.py`, or `chrome-network-logger` after installation.
+- Browser-level CDP attachment for independent tabs and popups.
+- Request identity namespaced by `sessionId`, `requestId`, and redirect hop.
+- Every 3xx hop is retained separately, including its `ExtraInfo` data.
+- Graceful shutdown flushes in-flight requests and open WebSocket/WebTransport connections as `incomplete`.
+- Bodies are external, compressed, size-limited, and SHA-256 deduplicated instead of duplicated in multiple JSONL files.
+- WebSocket frames and SSE messages are streamed to disk rather than accumulated indefinitely in RAM.
+- One canonical source: `network/requests.jsonl`.
+- Normalized timestamps (`epochMs`, local ISO time, and CDP monotonic time when available).
+- Start/end cookie and localStorage/sessionStorage snapshots.
+- Dedicated browser console, exception, log, navigation, and target files.
+- A single interaction script with a stable installation marker; generated HTML escapes captured markup.
+- Sensitive values are redacted by default while retaining their length and a per-session HMAC.
+- Rewritten proxy relay with correct socket lifecycle, IPv6, HTTP(S) upstream support, and live direct/proxy switching on Windows.
+- Modular package, unit tests, and Windows/Linux CI.
 
-- Dedicated Chrome profile (no interference with your main browser)
-- User interactions go through a CDP **binding** with a random name (re-generated each run), not `console.log` → not detectable by classic anti-bot scripts that monitor the console
-- The binding name is removed from `window` immediately after install
-- `FORM_INTERCEPT_JS` also uses the binding (no `console.log` markers)
-
-## 📦 Install
+## Installation
 
 ```bash
-pip install websocket-client psutil
+python -m pip install -e .
 ```
 
-Chrome must be installed at one of the default Windows paths (the script auto-detects).
+For development:
 
-## 🚀 Usage
+```bash
+python -m pip install -e .[dev]
+python -m pytest
+python -m ruff check .
+```
+
+Requires Python 3.10+ and Chrome or Chromium.
+
+## Usage
 
 ```bash
 python chrome_network_logger.py
 ```
 
-**First run**: the script creates an empty profile under `./capture_profile/`. Chrome opens, you log in to your target site, configure cookies, etc. Press `Ctrl+C` to save.
+On first run, an isolated profile is created at `./capture_profile`. Your normal Chrome profile is not used.
 
-**Subsequent runs**: your profile + cookies/sessions are reused as-is.
+Examples:
 
-You'll be prompted for a session subfolder name (useful to group sessions per site).
+```bash
+# XHR/Fetch/Document bodies, secrets redacted — defaults
+python chrome_network_logger.py --body-mode api --sensitive safe
 
-## 🌐 Proxy support
+# Wider body capture
+python chrome_network_logger.py --body-mode all
 
-Drop a `proxy.txt` file next to the script. All these formats are auto-detected:
+# Metadata, headers and timings only
+python chrome_network_logger.py --body-mode none
 
+# Raw credentials, cookies and tokens are preserved
+python chrome_network_logger.py --sensitive raw
+
+# Explicit output/profile locations
+python chrome_network_logger.py --output-dir captures/example --profile-dir profiles/example
+
+# Automation without prompts
+python chrome_network_logger.py --non-interactive --output-dir captures
 ```
-host:port
-host:port:user:pass
-user:pass@host:port
-http://host:port
-https://user:pass@host:port
-socks5://host:port
-socks4://user:pass@host:port
-host port              (space/tab-separated)
-host port user pass    (space/tab-separated, e.g. Decodo / Bright Data exports)
-```
 
-**Selection behaviour (multiple proxies):**
+Important options:
 
-| Command | Behaviour |
+| Option | Effect |
 |---|---|
-| `python chrome_network_logger.py` | picks one **at random** |
-| `--proxy-prompt` | shows a numbered list, prompts you to choose |
-| `--proxy 2` | uses proxy #2 from the file |
-| `--proxy random` | explicit random (same as default) |
-| `--proxy none` | disables proxy even if `proxy.txt` exists |
-| `--proxy-file other.txt` | loads proxies from a different file |
+| `--body-mode none\|api\|all` | HTTP body and WebSocket/SSE payload policy |
+| `--max-body-mb 32` | Maximum stored bytes per body; `0` means unlimited |
+| `--sensitive safe\|raw` | Default redaction or raw preservation |
+| `--no-interactions` | Disable injected clicks, inputs, forms, and SPA navigation events |
+| `--capture-clipboard` | Capture pasted text; redacted in safe mode |
+| `--no-console` | Disable console, exceptions, and Log-domain files |
+| `--no-storage` | Disable cookie and Web Storage snapshots |
+| `--keep-chrome` | Leave Chrome open after disabling Fetch, auto-attach, and injected listeners |
+| `--chrome-path PATH` | Explicit Chrome/Chromium executable |
 
-If credentials are present, a tiny unpacked Chrome extension is generated on the fly to feed them to `webRequest.onAuthRequired` (no auth prompt).
+## Output
 
-## 📁 Output layout
-
+```text
+session_YYYYMMDD_HHMMSS_mmm/
+├── manifest.json
+├── timeline.jsonl
+├── network/
+│   ├── requests.jsonl
+│   └── bodies/<sha256>.*[.gz]
+├── realtime/
+├── interactions/
+├── browser/                 # includes protocol_capabilities.jsonl
+├── snapshots/
+└── reports/
+    ├── summary.txt
+    ├── stats.txt
+    ├── requests.csv
+    └── interactions.html
 ```
-session_YYYYMMDD_HHMMSS/
-├── README.txt                     # Auto-generated description
-├── full/
-│   ├── requests.jsonl             # EVERYTHING (CSS, fonts, images, XHR, WS…)
-│   └── summary.txt                # Human-readable summary
-├── filtered/
-│   ├── requests.jsonl             # Only XHR/Fetch/Document/WebSocket/EventSource
-│   └── summary.txt
-├── events/
-│   ├── full/events.jsonl          # All user interactions with FULL detail
-│   │                              # (cssPath, xpath, attrs, outerHTML, value…)
-│   └── summary/
-│       ├── events.jsonl           # Slim version (event/ts/url/outerHTML)
-│       └── events.html            # Browsable HTML view
-├── form_submit_captured.json      # All submitted forms (FormData incl. password)
-└── cookies_<label>.json           # Cookie dumps (auto post-login + manual)
+
+`network/requests.jsonl` is canonical. The `isApi` field provides filtering without maintaining duplicate `full` and `filtered` bodies.
+
+Each body reference records its relative path, SHA-256, original/stored size, MIME type, compression, truncation, and redaction state.
+
+## Sensitive-data handling
+
+The default `--sensitive safe` mode redacts authorization and cookie headers, passwords, secrets, API keys, access/refresh/ID tokens, OTP/PIN/CVV-like values, sensitive URL parameters, structured JSON/form fields, password inputs, sensitive form fields, and clipboard payloads.
+
+A redacted value looks like:
+
+```text
+<redacted len=123 hmac=4ab31c8702ef>
 ```
 
-## ⚠️ Security & Legal Notice
+The HMAC uses a random key created for each capture: equal values can be compared **within one session**, but not across sessions. The key is not written to the logs. Sensitive input and form values are instead redacted inside the page as `<redacted len=N source=browser>`: the raw value never crosses the CDP binding, and this length-only marker is not an equality fingerprint. Raw mode must be selected explicitly.
 
-This tool captures **plaintext passwords, tokens, session cookies, and any text you type or paste**. It is intended for:
+Safe mode is a protective default, not a guarantee that every possible secret will be recognized. A proprietary format, binary payload, or sensitive field with an unusual name may remain visible, so every capture should still be treated as confidential.
 
-- Debugging your own web applications
-- Reverse-engineering APIs you have permission to access
-- Security research on your own systems
+## Proxy support
 
-**Do not** use it on services you don't own or don't have explicit permission to inspect. Store the `session_*` folders on encrypted storage and never commit them to a public repo.
+Supported `proxy.txt` examples:
 
-## 🛠️ How it works
+```text
+host:port
+host:port:user:password
+user:password@host:port
+http://host:port
+https://user:password@host:port
+socks5://host:port
+[2001:db8::1]:8080
+host port user password
+```
 
-1. Launches Chrome with `--remote-debugging-port=<free>` pointing at the dedicated profile
-2. Connects to CDP over WebSocket
-3. Enables: `Network`, `Page`, `Runtime`, `Fetch` (intercepts all URLs to grab `postData` on form navigations), `Target` (auto-attach to new tabs/workers)
-4. Registers a `Runtime.addBinding` and injects JS to forward user interactions via that binding
-5. Listens to all CDP events, writes one entry per request to JSONL
+```bash
+python chrome_network_logger.py --proxy random
+python chrome_network_logger.py --proxy 2
+python chrome_network_logger.py --proxy none
+python chrome_network_logger.py --proxy-prompt
+```
 
-## 📜 License
+HTTP(S) upstreams use a loopback relay that injects proxy authentication and supports **P** to switch between the upstream and direct routing on Windows. Active sockets are closed during a switch. Unauthenticated SOCKS proxies are passed directly to Chrome; authenticated SOCKS is rejected clearly rather than pretending to support it. HTTPS upstream certificate verification is enabled unless `--proxy-insecure-tls` is explicitly used.
+
+## CDP scope and limitations
+
+- `Network.getRequestPostData` omits uploaded file bytes in multipart requests. When Chrome separately exposes `postDataEntries.bytes`, the logger externalizes them, but availability still depends on what CDP provides for that request.
+- Network-domain WebTransport events expose lifecycle, not stream/datagram payloads.
+- Very large or streaming responses may exceed CDP buffers or the configured body limit.
+- Redirect response bodies are not exposed by `Fetch.getResponseBody`; redirect metadata and headers are still retained per hop.
+- Raw packet traffic and WebRTC media/DataChannel data remain out of scope.
+- Fetch interception is limited to response-stage `Document` requests instead of pausing every browser request.
+- Experimental or unavailable Chrome commands are recorded in `browser/protocol_capabilities.jsonl`; one unsupported capability does not automatically mark the entire session as failed.
+
+Official references: [Network](https://chromedevtools.github.io/devtools-protocol/tot/Network/), [Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/), and [Fetch](https://chromedevtools.github.io/devtools-protocol/tot/Fetch/).
+
+## Code architecture
+
+```text
+chrome_logger/
+├── cli.py                 # program lifecycle
+├── cdp.py                 # CDP client, targets, pending commands, shutdown
+├── network_capture.py     # HTTP, redirects, ExtraInfo, and bodies
+├── realtime_capture.py    # WebSocket, SSE, and WebTransport
+├── browser_capture.py     # interactions, console, navigation, snapshots
+├── registry.py            # session/request/hop identity and ExtraInfo ordering
+├── storage.py             # writer thread, JSONL, bodies, and reports
+├── redaction.py           # contextual redaction
+├── proxy.py               # parsing and HTTP(S) relay
+└── chrome.py              # dedicated-profile launch and cleanup
+```
+
+`chrome_network_logger.py` remains a compatible wrapper. Tests cover registries, CDP handlers, timestamps, storage, redaction, proxy behavior, and the injected interaction script.
+
+## Security and authorization
+
+Use this tool only for applications, accounts, and systems you own or are authorized to inspect. Even safe-mode captures can contain private URLs and session metadata. `session_*`, `capture_profile`, and `proxy.txt` are excluded by Git.
+
+## License
 
 MIT
-
----
-
-> 🤖 **Full disclosure:** This project was built by [@Antoninnnnnnnn](https://github.com/Antoninnnnnnnn) who freely admits he doesn't understand a single line of this code. The real MVP here is AI pair programming. Turns out you don't need to know how to code to ship code. Welcome to 2026.

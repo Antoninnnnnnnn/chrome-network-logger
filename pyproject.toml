@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chrome-network-logger"
+version = "3.0.0"
+description = "Application-layer Chrome traffic and interaction logger using browser-level CDP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "Antoninnnnnnnn"}]
+keywords = ["chrome", "cdp", "network", "websocket", "debugging"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "psutil>=5.9",
+  "websocket-client>=1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/Antoninnnnnnnn/chrome-network-logger"
+Repository = "https://github.com/Antoninnnnnnnn/chrome-network-logger"
+Issues = "https://github.com/Antoninnnnnnnn/chrome-network-logger/issues"
+
+[project.scripts]
+chrome-network-logger = "chrome_logger.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["chrome_logger*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]

@@ -1,17 +1,30 @@
-# Captured sessions (contain plaintext passwords/cookies)
+# Captures and dedicated browser state
 session_*/
 capture_profile/
+captures/
+profiles/
 
 # Proxy credentials
 proxy.txt
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
+build/
+dist/
 
-# OS
+# Editors and OS
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
+
+# Local package artifacts
+*.whl
