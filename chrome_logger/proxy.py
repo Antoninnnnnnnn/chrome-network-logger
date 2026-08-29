@@ -319,6 +319,7 @@ class ProxyRelay:
         if self.upstream.scheme == "https":
             try:
                 context = ssl.create_default_context()
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
                 if not self.verify_tls:
                     context.check_hostname = False
                     context.verify_mode = ssl.CERT_NONE

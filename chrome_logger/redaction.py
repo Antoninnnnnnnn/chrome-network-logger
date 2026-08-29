@@ -190,6 +190,9 @@ def _is_sensitive_url_parameter(key: Any) -> bool:
 
 def _fingerprint(value: Any, key: bytes) -> str:
     raw = str(value).encode("utf-8", errors="replace")
+    # This is a short, randomly keyed per-capture correlation tag, not a
+    # password verifier or stored password hash. A fast HMAC is intentional.
+    # codeql[py/weak-sensitive-data-hashing]
     digest = hmac.new(key, raw, hashlib.sha256).hexdigest()[:12]
     return f"<redacted len={len(raw)} hmac={digest}>"
 

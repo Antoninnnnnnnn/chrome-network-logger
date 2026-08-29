@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ssl
+
 import pytest
 
-from chrome_logger.proxy import ProxySpec, _split_authority, parse_proxy_line, select_proxy
+from chrome_logger import proxy as proxy_module
+from chrome_logger.proxy import ProxyRelay, ProxySpec, _split_authority, parse_proxy_line, select_proxy
 
 
 @pytest.mark.parametrize(
@@ -51,3 +54,34 @@ def test_explicit_proxy_request_fails_when_file_has_no_valid_entries() -> None:
         select_proxy([], "random")
     with pytest.raises(ValueError, match="No valid proxy"):
         select_proxy([], None, prompt=True)
+
+
+@pytest.mark.parametrize("verify_tls", [True, False])
+def test_https_upstream_requires_tls_1_2(monkeypatch, verify_tls: bool) -> None:
+    class FakeContext:
+        minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        check_hostname = True
+        verify_mode = ssl.CERT_REQUIRED
+
+        def wrap_socket(self, raw, *, server_hostname):
+            assert server_hostname == "proxy.example"
+            assert self.minimum_version == ssl.TLSVersion.TLSv1_2
+            return raw
+
+    raw = object()
+    context = FakeContext()
+    monkeypatch.setattr(proxy_module.socket, "create_connection", lambda *_args, **_kwargs: raw)
+    monkeypatch.setattr(proxy_module.ssl, "create_default_context", lambda: context)
+    relay = ProxyRelay(ProxySpec("https", "proxy.example", 443), verify_tls=verify_tls)
+    relay.start()
+    try:
+        assert relay._connect_upstream() is raw
+        assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+        if verify_tls:
+            assert context.check_hostname is True
+            assert context.verify_mode == ssl.CERT_REQUIRED
+        else:
+            assert context.check_hostname is False
+            assert context.verify_mode == ssl.CERT_NONE
+    finally:
+        relay.stop()

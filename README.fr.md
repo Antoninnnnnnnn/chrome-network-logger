@@ -27,7 +27,7 @@ Outil Python pour capturer le **trafic applicatif visible par Chrome** avec le C
 - Relay proxy réécrit : sockets correctement suivis/fermés, IPv6, proxy HTTP ou HTTPS, bascule directe en live sous Windows.
 - Les erreurs fatales CDP/writer produisent un manifeste `error` et un code de sortie non nul, sans faux succès.
 - Payloads d’interaction, `ExtraInfo` en attente, connexions proxy et file du writer sont bornés.
-- Package typé, 81 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
+- Package typé, 83 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
 
 ## Installation
 

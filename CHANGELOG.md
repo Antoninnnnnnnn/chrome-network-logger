@@ -2,6 +2,14 @@
 
 All notable changes to Chrome Network Logger are documented here.
 
+## 3.0.1 — 2026-08-29
+
+### Security hardening
+
+- Require TLS 1.2 or newer when connecting to an HTTPS upstream proxy, including when certificate verification is explicitly disabled.
+- Document the intentionally fast, randomly keyed per-session HMAC fingerprint so static analysis does not confuse it with password storage.
+- Add regression coverage for verified and intentionally unverified HTTPS upstream contexts (83 tests total).
+
 ## 3.0.0 — 2026-08-29
 
 ### Capture reliability
