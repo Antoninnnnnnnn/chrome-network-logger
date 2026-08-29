@@ -206,6 +206,7 @@ class RealtimeCaptureMixin:
                 "payloadCapture": "CDP Network exposes lifecycle only",
             }
             self.stats["webTransports"] += 1
+            self.stats["requests"] += 1
 
     def _webtransport_established(self, session_id: str | None, params: dict[str, Any]) -> None:
         transport_id = params.get("transportId")
@@ -214,6 +215,7 @@ class RealtimeCaptureMixin:
                 entry = self.webtransports.get(self._transport_key(session_id, str(transport_id)))
                 if entry:
                     entry["established"] = self.timestamps.normalize(params.get("timestamp"))
+                    self.stats["responses"] += 1
 
     def _webtransport_closed(self, session_id: str | None, params: dict[str, Any]) -> None:
         transport_id = params.get("transportId")
@@ -250,4 +252,3 @@ class RealtimeCaptureMixin:
             network_entry["incomplete"] = True
             network_entry["incompleteReason"] = entry.get("incompleteReason")
         self.store.write_jsonl("network/requests.jsonl", network_entry, redact=True)
-

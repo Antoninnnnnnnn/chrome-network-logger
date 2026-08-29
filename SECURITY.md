@@ -10,7 +10,7 @@ Never commit captures, `capture_profile`, or proxy credentials. The repository `
 
 ## Reporting a vulnerability
 
-Please open a private GitHub security advisory for vulnerabilities in the logger itself. Do not include real credentials, session cookies, private captures, or third-party data in a public issue.
+Please use [GitHub private vulnerability reporting](https://github.com/Antoninnnnnnnn/chrome-network-logger/security/advisories/new) for vulnerabilities in the logger itself. Do not include real credentials, session cookies, private captures, or third-party data in a public issue.
 
 A useful report contains:
 
@@ -20,6 +20,14 @@ A useful report contains:
 - expected and actual behavior;
 - impact and any proposed fix.
 
-## Supported version
+## Scope and supported versions
 
-Security fixes target the latest v3 release. The historical v2 monolithic implementation is superseded and should not be used for new sensitive captures.
+| Version | Security fixes |
+|---|---|
+| Latest 3.x release | Yes |
+| Older 3.x releases | Upgrade required |
+| 2.x and earlier | No |
+
+Security fixes target the latest v3 release. The historical v2 monolithic implementation is superseded and should not be used for new sensitive captures. Bugs in third-party websites, Chrome itself, upstream proxies, or systems observed with the logger are outside this repository's security scope.
+
+The project threat model is documented in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).

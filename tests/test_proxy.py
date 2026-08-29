@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from chrome_logger.proxy import ProxySpec, _split_authority, parse_proxy_line
+from chrome_logger.proxy import ProxySpec, _split_authority, parse_proxy_line, select_proxy
 
 
 @pytest.mark.parametrize(
@@ -38,3 +38,16 @@ def test_split_authority_ipv4_and_ipv6() -> None:
     assert _split_authority("example.com:443", 80) == ("example.com", 443)
     assert _split_authority("[2001:db8::1]:8443", 443) == ("2001:db8::1", 8443)
     assert _split_authority("2001:db8::1", 443) == ("2001:db8::1", 443)
+
+
+def test_proxy_is_never_enabled_implicitly() -> None:
+    proxies = [ProxySpec("http", "one.example", 8080), ProxySpec("http", "two.example", 8080)]
+    assert select_proxy(proxies, None) is None
+    assert select_proxy(proxies, "none") is None
+
+
+def test_explicit_proxy_request_fails_when_file_has_no_valid_entries() -> None:
+    with pytest.raises(ValueError, match="No valid proxy"):
+        select_proxy([], "random")
+    with pytest.raises(ValueError, match="No valid proxy"):
+        select_proxy([], None, prompt=True)

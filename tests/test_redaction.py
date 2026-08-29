@@ -47,12 +47,8 @@ def test_cookie_objects_keep_metadata_but_hide_values() -> None:
     redactor = Redactor("safe")
     output = redactor.object(
         {
-            "cookies": [
-                {"name": "sid", "value": "cookie-secret", "domain": "example.com", "path": "/"}
-            ],
-            "associatedCookies": [
-                {"cookie": {"name": "auth", "value": "nested-secret", "domain": "example.com"}}
-            ],
+            "cookies": [{"name": "sid", "value": "cookie-secret", "domain": "example.com", "path": "/"}],
+            "associatedCookies": [{"cookie": {"name": "auth", "value": "nested-secret", "domain": "example.com"}}],
         }
     )
     cookie = output["cookies"][0]
@@ -167,3 +163,18 @@ def test_jwt_basic_auth_and_url_userinfo_are_redacted() -> None:
     assert clean_url is not None
     assert "user" not in clean_url
     assert "password" not in clean_url
+
+
+def test_html_value_srcdoc_and_active_content_urls_are_redacted() -> None:
+    redactor = Redactor("safe")
+    html = '<form><input name="csrf_token" value="synthetic-secret"><iframe srcdoc="secret html"></iframe></form>'
+    clean = redactor.interaction({"target": {"outerHTML": html}})
+    rendered = clean["target"]["outerHTML"]
+    assert "synthetic-secret" not in rendered
+    assert "secret html" not in rendered
+    assert "<redacted" in rendered
+
+    data_url = redactor.url("data:text/plain,synthetic-secret")
+    javascript_url = redactor.url("javascript:syntheticSecret()")
+    assert data_url is not None and "synthetic-secret" not in data_url
+    assert javascript_url is not None and "syntheticSecret" not in javascript_url

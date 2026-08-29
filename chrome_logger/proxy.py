@@ -8,9 +8,9 @@ import socket
 import ssl
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import unquote, urlsplit
 
 LOG = logging.getLogger(__name__)
@@ -123,9 +123,11 @@ def select_proxy(proxies: list[ProxySpec], selector: str | None, prompt: bool = 
     if selector == "none":
         return None
     if not proxies:
+        if prompt or selector not in {None, "none"}:
+            raise ValueError("No valid proxy is available in the configured proxy file")
         return None
     if selector is None and not prompt:
-        return proxies[0] if len(proxies) == 1 else __import__("random").choice(proxies)
+        return None
     if selector in {None, "random"}:
         if selector == "random" and not prompt:
             return __import__("random").choice(proxies)
@@ -205,12 +207,23 @@ def _replace_headers(header_block: bytes, *, remove: Iterable[bytes], add: Itera
 class ProxyRelay:
     """Local HTTP proxy that can forward through an HTTP(S) upstream or directly."""
 
-    def __init__(self, upstream: ProxySpec, *, connect_timeout: float = 15.0, verify_tls: bool = True):
+    def __init__(
+        self,
+        upstream: ProxySpec,
+        *,
+        connect_timeout: float = 15.0,
+        verify_tls: bool = True,
+        max_connections: int = 512,
+    ):
         if upstream.scheme not in {"http", "https"}:
             raise ValueError("ProxyRelay supports HTTP and HTTPS upstream proxies only")
         self.upstream = upstream
         self.connect_timeout = connect_timeout
         self.verify_tls = verify_tls
+        if max_connections < 1:
+            raise ValueError("max_connections must be positive")
+        self.max_connections = max_connections
+        self._connection_slots = threading.BoundedSemaphore(max_connections)
         self._enabled = True
         self._state_lock = threading.RLock()
         self._active: set[socket.socket] = set()
@@ -254,13 +267,33 @@ class ProxyRelay:
         while not self._stop.is_set():
             try:
                 client, _ = self._server.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
             client.settimeout(self.connect_timeout)
+            if not self._connection_slots.acquire(blocking=False):
+                try:
+                    client.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+                except OSError:
+                    pass
+                finally:
+                    self._close_socket(client)
+                continue
             self._track(client)
-            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+            try:
+                threading.Thread(target=self._handle_guarded, args=(client,), daemon=True).start()
+            except Exception:
+                self._untrack(client)
+                self._close_socket(client)
+                self._connection_slots.release()
+                raise
+
+    def _handle_guarded(self, client: socket.socket) -> None:
+        try:
+            self._handle(client)
+        finally:
+            self._connection_slots.release()
 
     def _track(self, sock: socket.socket) -> None:
         with self._state_lock:
@@ -274,12 +307,12 @@ class ProxyRelay:
     def _close_socket(sock: socket.socket) -> None:
         try:
             sock.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
+        except OSError as exc:
+            LOG.debug("Socket shutdown ignored: %s", exc)
         try:
             sock.close()
-        except Exception:
-            pass
+        except OSError as exc:
+            LOG.debug("Socket close ignored: %s", exc)
 
     def _connect_upstream(self) -> socket.socket:
         raw = socket.create_connection((self.upstream.host, self.upstream.port), timeout=self.connect_timeout)
@@ -320,7 +353,11 @@ class ProxyRelay:
                     if auth:
                         additions.append(f"Proxy-Authorization: {auth}".encode("latin-1"))
                     request = (
-                        b"CONNECT " + target_b + b" " + version + b"\r\n"
+                        b"CONNECT "
+                        + target_b
+                        + b" "
+                        + version
+                        + b"\r\n"
                         + f"Host: {target}\r\n".encode("latin-1")
                         + b"\r\n".join(additions)
                         + b"\r\n\r\n"
@@ -392,8 +429,8 @@ class ProxyRelay:
             LOG.debug("Proxy relay connection failed: %s", exc)
             try:
                 client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-            except Exception:
-                pass
+            except OSError as send_exc:
+                LOG.debug("Could not return proxy failure response: %s", send_exc)
         finally:
             for sock in (client, upstream):
                 if sock is not None:

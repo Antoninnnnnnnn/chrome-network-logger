@@ -163,7 +163,11 @@ class NetworkCaptureMixin:
             entry["encodedDataLength"] = params.get("encodedDataLength")
             entry["finished"] = self.timestamps.normalize(params.get("timestamp"))
             entry["_loadingComplete"] = True
-            if entry.get("_fetchBodyComplete") or not self._should_capture_body(entry) or not self._response_can_have_body(entry):
+            if (
+                entry.get("_fetchBodyComplete")
+                or not self._should_capture_body(entry)
+                or not self._response_can_have_body(entry)
+            ):
                 self._schedule_finalize(key, reason="loadingFinished")
                 return
             if entry.get("_pendingFetchBody"):
@@ -202,9 +206,11 @@ class NetworkCaptureMixin:
             return
         fetch_id = str(fetch_id)
         if self._quiescing:
-            method = "Fetch.continueResponse" if (
-                params.get("responseStatusCode") is not None or params.get("responseErrorReason") is not None
-            ) else "Fetch.continueRequest"
+            method = (
+                "Fetch.continueResponse"
+                if (params.get("responseStatusCode") is not None or params.get("responseErrorReason") is not None)
+                else "Fetch.continueRequest"
+            )
             self.send(method, {"requestId": fetch_id}, session_id)
             return
         if params.get("responseStatusCode") is None and params.get("responseErrorReason") is None:
@@ -249,7 +255,7 @@ class NetworkCaptureMixin:
             if str(key).lower() == "content-type":
                 return str(value)
         extra_side = "request" if request else "response"
-        extra_headers = (((entry.get("extraInfo") or {}).get(extra_side) or {}).get("headers") or {})
+        extra_headers = ((entry.get("extraInfo") or {}).get(extra_side) or {}).get("headers") or {}
         for key, value in extra_headers.items():
             if str(key).lower() == "content-type":
                 return str(value)
@@ -369,9 +375,7 @@ class NetworkCaptureMixin:
                     self.finalize_deadlines.pop(key, None)
                     continue
                 waiting_command = bool(
-                    entry.get("_pendingPostData")
-                    or entry.get("_pendingResponseBody")
-                    or entry.get("_pendingFetchBody")
+                    entry.get("_pendingPostData") or entry.get("_pendingResponseBody") or entry.get("_pendingFetchBody")
                 )
                 if waiting_command:
                     # The matching command timeout handler owns the deadline.
@@ -404,8 +408,8 @@ class NetworkCaptureMixin:
         entry["isApi"] = self._is_api(entry)
         if reason:
             entry["finalizeReason"] = reason
-        started_ms = ((entry.get("started") or {}).get("epochMs"))
-        finished_ms = ((entry.get("finished") or {}).get("epochMs"))
+        started_ms = (entry.get("started") or {}).get("epochMs")
+        finished_ms = (entry.get("finished") or {}).get("epochMs")
         if started_ms is not None and finished_ms is not None:
             entry["durationMs"] = max(0, finished_ms - started_ms)
         for private_key in [key_name for key_name in entry if key_name.startswith("_")]:
@@ -420,4 +424,3 @@ class NetworkCaptureMixin:
             status=(entry.get("response") or {}).get("status"),
             failed=bool(entry.get("failure")),
         )
-

@@ -11,7 +11,22 @@ from .models import PendingCommand
 
 class BrowserCaptureMixin:
     def _user_event(self, session_id: str | None, params: dict[str, Any]) -> None:
-        payload_text = params.get("payload") or ""
+        payload_text = str(params.get("payload") or "")
+        payload_size = len(payload_text.encode("utf-8", errors="replace"))
+        if payload_size > self.config.max_interaction_payload_bytes:
+            self.stats["droppedUserEvents"] += 1
+            self.store.add_warning(
+                f"Dropped an oversized interaction payload ({payload_size} bytes; "
+                f"limit {self.config.max_interaction_payload_bytes})"
+            )
+            return
+        context_id = params.get("executionContextId")
+        if context_id is not None:
+            with self.state_lock:
+                allowed = int(context_id) in self.interaction_contexts.get(session_id or "", set())
+            if not allowed:
+                self.stats["droppedUserEvents"] += 1
+                return
         try:
             payload = json.loads(payload_text)
         except Exception:
@@ -19,6 +34,7 @@ class BrowserCaptureMixin:
         if not isinstance(payload, dict):
             payload = {"event": "unknown", "value": payload}
         payload["sessionId"] = session_id
+        payload["executionContextId"] = context_id
         payload["targetContext"] = self._target(session_id)
         timestamp = self.timestamps.from_epoch_ms(payload.get("ts"))
         payload["time"] = timestamp
@@ -109,8 +125,8 @@ class BrowserCaptureMixin:
             };
         })()"""
         with self.state_lock:
-            sessions = [(sid, info) for sid, info in self.targets.items() if info.get("type") in PAGE_TYPES]
-        for session_id, info in sessions:
+            sessions = [sid for sid, info in self.targets.items() if info.get("type") in PAGE_TYPES]
+        for session_id in sessions:
             with self.state_lock:
                 self._snapshot_pending += 1
             self.send(
@@ -237,10 +253,11 @@ class BrowserCaptureMixin:
 
   const descriptor = (el) => `${el.type || ''} ${el.name || ''} ${el.id || ''} ${el.autocomplete || ''} ${el.placeholder || ''}`;
   const isSensitiveElement = (el) => String(el.type || '').toLowerCase() === 'password' || looksSensitive(descriptor(el));
+  const isFormControl = (el) => el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement;
   const valueOf = (el) => {
     if (!('value' in el)) return null;
     const value = String(el.value ?? '').slice(0, 5000);
-    return SAFE && isSensitiveElement(el) ? redact(value) : value;
+    return SAFE && (isSensitiveElement(el) || isFormControl(el)) ? redact(value) : value;
   };
 
   const describe = (el) => {
@@ -248,15 +265,17 @@ class BrowserCaptureMixin:
     const rect = el.getBoundingClientRect();
     const attrs = {};
     for (const attr of Array.from(el.attributes).slice(0, 100)) {
-      attrs[attr.name] = String(attr.value).slice(0, 1000);
+      const name = String(attr.name || '').toLowerCase();
+      const value = String(attr.value).slice(0, 1000);
+      attrs[attr.name] = SAFE && (name === 'value' || name === 'srcdoc' || looksSensitive(name)) ? redact(value) : value;
     }
     const sensitiveElement = isSensitiveElement(el);
-    if (SAFE && sensitiveElement && Object.prototype.hasOwnProperty.call(attrs, 'value')) {
-      attrs.value = redact(attrs.value);
-    }
     let outerHTML = '';
-    try { outerHTML = String(el.outerHTML || '').slice(0, 8000); } catch (_) {}
-    if (SAFE && sensitiveElement) outerHTML = `<${el.tagName.toLowerCase()} data-sensitive-redacted="true">`;
+    if (SAFE) {
+      outerHTML = `<${el.tagName.toLowerCase()} data-capture-redacted="true">`;
+    } else {
+      try { outerHTML = String(el.outerHTML || '').slice(0, 8000); } catch (_) {}
+    }
     return {
       tag: el.tagName.toLowerCase(), id: el.id || null,
       classes: typeof el.className === 'string' ? el.className : null,
@@ -264,7 +283,7 @@ class BrowserCaptureMixin:
       ariaLabel: el.getAttribute('aria-label'), placeholder: el.getAttribute('placeholder'),
       autocomplete: el.getAttribute('autocomplete'), value: valueOf(el),
       checked: ('checked' in el) ? Boolean(el.checked) : null,
-      text: String(el.innerText || el.textContent || '').trim().slice(0, 500),
+      text: SAFE && (sensitiveElement || isFormControl(el)) ? '' : String(el.innerText || el.textContent || '').trim().slice(0, 500),
       href: el.getAttribute('href'), attrs,
       rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
       cssPath: cssPath(el), xpath: xpath(el), outerHTML
@@ -293,13 +312,10 @@ class BrowserCaptureMixin:
     const data = {};
     try {
       new FormData(form).forEach((value, key) => {
-        const element = form.elements.namedItem(key);
-        const fieldDescriptor = `${key} ${element && element.type || ''} ${element && element.autocomplete || ''}`;
-        const isSensitive = looksSensitive(fieldDescriptor) || Boolean(element && String(element.type).toLowerCase() === 'password');
         const normalized = value instanceof File
-          ? {name: value.name, size: value.size, type: value.type}
+          ? {name: SAFE ? redact(value.name) : value.name, size: value.size, type: value.type}
           : String(value).slice(0, 10000);
-        const clean = SAFE && isSensitive ? redact(normalized) : normalized;
+        const clean = SAFE && !(value instanceof File) ? redact(normalized) : normalized;
         if (Object.prototype.hasOwnProperty.call(data, key)) {
           data[key] = Array.isArray(data[key]) ? [...data[key], clean] : [data[key], clean];
         } else {
@@ -327,4 +343,3 @@ class BrowserCaptureMixin:
             .replace("__SAFE__", "true" if self.config.sensitive_mode == "safe" else "false")
             .replace("__CLIPBOARD__", "true" if self.config.capture_clipboard else "false")
         )
-

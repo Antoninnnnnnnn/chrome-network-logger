@@ -47,7 +47,9 @@ def test_http_upstream_auth_is_injected() -> None:
     relay.start()
     try:
         with closing(socket.create_connection(("127.0.0.1", relay.local_port), timeout=2)) as client:
-            client.sendall(b"GET http://example.test/demo HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n")
+            client.sendall(
+                b"GET http://example.test/demo HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n"
+            )
             response = bytearray()
             while True:
                 chunk = client.recv(4096)

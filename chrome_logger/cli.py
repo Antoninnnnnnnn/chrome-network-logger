@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import signal
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from . import __version__
 from .cdp import CDPCapture
 from .chrome import (
     cleanup_profile_locks,
     find_chrome,
-    find_free_port,
     kill_profile_chrome_processes,
     launch_chrome,
+    profile_chrome_process_ids,
     wait_for_cdp,
 )
 from .config import CaptureConfig
@@ -46,6 +49,26 @@ def _output_parent(argument: str | None, non_interactive: bool) -> Path:
     return path
 
 
+def _non_negative_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be finite and >= 0")
+    return parsed
+
+
+def _start_url(value: str) -> str:
+    candidate = value.strip()
+    if candidate.startswith("-"):
+        raise argparse.ArgumentTypeError("must be a URL, not a Chrome option")
+    scheme = urlsplit(candidate).scheme.casefold()
+    if scheme not in {"about", "chrome", "data", "file", "http", "https"}:
+        raise argparse.ArgumentTypeError("must use about, chrome, data, file, http, or https")
+    return candidate
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Chrome Network Logger v3 — application-layer capture through browser-level CDP",
@@ -54,25 +77,61 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", help="Parent directory for the timestamped session")
     parser.add_argument("--profile-dir", default="capture_profile", help="Dedicated Chrome profile directory")
     parser.add_argument("--chrome-path", help="Explicit Chrome/Chromium executable")
+    parser.add_argument(
+        "--start-url",
+        type=_start_url,
+        default="about:blank",
+        help="Initial page; about:blank avoids unsolicited new-tab traffic",
+    )
     parser.add_argument("--body-mode", choices=("none", "api", "all"), default="api")
-    parser.add_argument("--max-body-mb", type=float, default=32.0, help="Maximum stored bytes per body; 0 means unlimited")
-    parser.add_argument("--sensitive", choices=("safe", "raw"), default="safe", help="Redact secrets or preserve raw values")
+    parser.add_argument(
+        "--max-body-mb",
+        type=_non_negative_finite_float,
+        default=32.0,
+        help="Maximum stored bytes per body; 0 means unlimited",
+    )
+    parser.add_argument(
+        "--max-session-body-mb",
+        type=_non_negative_finite_float,
+        default=2048.0,
+        help="Maximum stored body bytes for the whole session; 0 means unlimited",
+    )
+    parser.add_argument(
+        "--sensitive", choices=("safe", "raw"), default="safe", help="Redact secrets or preserve raw values"
+    )
     parser.add_argument("--no-interactions", action="store_true", help="Disable click/input/form timeline capture")
-    parser.add_argument("--capture-clipboard", action="store_true", help="Capture paste payloads; redacted in safe mode")
+    parser.add_argument(
+        "--capture-clipboard", action="store_true", help="Capture paste payloads; redacted in safe mode"
+    )
     parser.add_argument("--no-console", action="store_true", help="Disable console/log/exception files")
     parser.add_argument("--no-storage", action="store_true", help="Disable cookie and Web Storage snapshots")
     parser.add_argument("--no-text-compression", action="store_true", help="Do not gzip textual bodies")
-    parser.add_argument("--proxy", metavar="N|random|none", help="Select a proxy from proxy.txt")
+    parser.add_argument(
+        "--proxy",
+        metavar="N|random|none",
+        default="none",
+        help="Select a proxy from proxy.txt; direct connection is the default",
+    )
     parser.add_argument("--proxy-prompt", action="store_true", help="Prompt for a proxy")
     parser.add_argument("--proxy-file", default="proxy.txt", help="Proxy list path")
-    parser.add_argument("--proxy-insecure-tls", action="store_true", help="Disable certificate verification for HTTPS upstream proxies")
-    parser.add_argument("--keep-chrome", action="store_true", help="Leave the dedicated Chrome window open after capture")
-    parser.add_argument("--non-interactive", action="store_true", help="Do not prompt for folders or first-run confirmation")
+    parser.add_argument(
+        "--proxy-insecure-tls", action="store_true", help="Disable certificate verification for HTTPS upstream proxies"
+    )
+    parser.add_argument(
+        "--keep-chrome", action="store_true", help="Leave the dedicated Chrome window open after capture"
+    )
+    parser.add_argument(
+        "--non-interactive", action="store_true", help="Do not prompt for folders or first-run confirmation"
+    )
+    parser.add_argument(
+        "--duration", type=_non_negative_finite_float, help="Stop automatically after this many seconds"
+    )
+    parser.add_argument("--version", action="version", version=f"chrome-network-logger {__version__}")
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -89,6 +148,7 @@ def main(argv: list[str] | None = None) -> None:
         body_mode=args.body_mode,
         sensitive_mode=args.sensitive,
         max_body_bytes=max(0, int(args.max_body_mb * 1024 * 1024)),
+        max_session_body_bytes=max(0, int(args.max_session_body_mb * 1024 * 1024)),
         capture_interactions=not args.no_interactions,
         capture_clipboard=args.capture_clipboard,
         capture_console=not args.no_console,
@@ -104,6 +164,12 @@ def main(argv: list[str] | None = None) -> None:
     killed = kill_profile_chrome_processes(profile_dir)
     if killed:
         LOG.info("Stopped %s orphan Chrome process(es) using the dedicated profile", killed)
+    remaining_profile_processes = profile_chrome_process_ids(profile_dir)
+    if remaining_profile_processes:
+        parser.error(
+            "Chrome is still using the dedicated profile; refusing to remove locks "
+            f"(PIDs: {', '.join(map(str, remaining_profile_processes))})"
+        )
     cleanup_profile_locks(profile_dir)
 
     if first_run and not args.non_interactive:
@@ -123,10 +189,19 @@ def main(argv: list[str] | None = None) -> None:
 
     redactor = Redactor(config.sensitive_mode)
     store = CaptureStore(config, redactor)
+
+    def safe_warning(message: str) -> None:
+        try:
+            store.add_warning(message)
+        except Exception:
+            LOG.exception("Could not persist warning: %s", message)
+
     if proxy:
         store.set_manifest(proxy={"enabled": True, "upstream": proxy.label(), "relay": bool(relay)})
+        LOG.info("Proxy route enabled: %s", proxy.label())
     else:
         store.set_manifest(proxy={"enabled": False})
+        LOG.info("Direct network route enabled")
 
     chrome = None
     capture = None
@@ -134,21 +209,31 @@ def main(argv: list[str] | None = None) -> None:
     keyboard_stop = threading.Event()
     stop_requested = threading.Event()
     shutdown_reason = "user"
+    exit_code = 0
+    started_at = time.monotonic()
+    if config.sensitive_mode == "raw":
+        print("WARNING: raw mode stores credentials, cookies and tokens without redaction.")
 
     def request_stop(signum=None, _frame=None) -> None:
         nonlocal shutdown_reason
         shutdown_reason = f"signal:{signum}" if signum is not None else "user"
         stop_requested.set()
 
+    previous_signal_handlers: dict[int, object] = {}
     for signal_name in ("SIGINT", "SIGTERM"):
         signum = getattr(signal, signal_name, None)
         if signum is not None:
-            signal.signal(signum, request_stop)
+            try:
+                previous_signal_handlers[signum] = signal.signal(signum, request_stop)
+            except ValueError:
+                LOG.debug("Signal handlers can only be installed from the main thread")
 
     try:
-        port = find_free_port()
-        chrome = launch_chrome(chrome_path, profile_dir, port, proxy_args)
+        # Chrome chooses the port atomically and writes it to DevToolsActivePort.
+        port = 0
+        chrome = launch_chrome(chrome_path, profile_dir, port, [*proxy_args, args.start_url])
         version = wait_for_cdp(chrome)
+        port = chrome.port
         LOG.info("Connected to %s", version.get("Browser"))
         capture = CDPCapture(port, config, store)
         if not capture.connect():
@@ -156,6 +241,7 @@ def main(argv: list[str] | None = None) -> None:
         capture_connected = True
 
         if relay:
+
             def on_toggle(enabled: bool) -> None:
                 store.write_jsonl(
                     "browser/proxy_toggles.jsonl",
@@ -175,57 +261,87 @@ def main(argv: list[str] | None = None) -> None:
         capture.wait_for_snapshots(config.shutdown_wait_seconds)
         print(f"\nCapture active: {store.base.resolve()}")
         print("Press Ctrl+C to stop and finalize the session.")
-        if config.sensitive_mode == "raw":
-            print("WARNING: raw mode stores credentials, cookies and tokens without redaction.")
 
         while not stop_requested.wait(0.5):
+            store.check_health()
             if chrome.process.poll() is not None:
                 shutdown_reason = "chromeExited"
                 break
+            if capture.failure.is_set():
+                detail = str(capture.fatal_error or "unknown CDP failure")
+                raise RuntimeError(f"Capture health check failed: {detail}")
             if capture.connection_closed.is_set():
                 shutdown_reason = "cdpDisconnected"
-                store.add_warning("The browser-level CDP WebSocket closed unexpectedly")
+                safe_warning("The browser-level CDP WebSocket closed unexpectedly")
+                break
+            if args.duration is not None and time.monotonic() - started_at >= args.duration:
+                shutdown_reason = "durationElapsed"
                 break
     except KeyboardInterrupt:
         shutdown_reason = "keyboardInterrupt"
-    except BaseException as exc:
+    except Exception as exc:
         shutdown_reason = f"error:{type(exc).__name__}"
+        exit_code = 1
         LOG.exception("Capture failed: %s", exc)
-        store.add_warning(f"Capture terminated with {type(exc).__name__}: {exc}")
-        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
-            raise
+        safe_warning(f"Capture terminated with {type(exc).__name__}: {exc}")
     finally:
         keyboard_stop.set()
         if capture and capture_connected:
             try:
                 capture.snapshot("end")
                 if not capture.wait_for_snapshots(config.shutdown_wait_seconds):
-                    store.add_warning("Timed out while waiting for final cookie/storage snapshots")
+                    safe_warning("Timed out while waiting for final cookie/storage snapshots")
             except Exception as exc:
-                store.add_warning(f"Final snapshot failed: {exc}")
+                safe_warning(f"Final snapshot failed: {exc}")
             try:
                 if not capture.wait_for_pending_data(config.shutdown_wait_seconds):
-                    store.add_warning("Timed out while waiting for pending response/request bodies")
+                    safe_warning("Timed out while waiting for pending response/request bodies")
                 if not capture.quiesce(config.shutdown_wait_seconds):
-                    store.add_warning("Timed out while waiting for CDP instrumentation teardown")
+                    safe_warning("Timed out while waiting for CDP instrumentation teardown")
                 capture.flush_open(shutdown_reason)
+            except Exception as exc:
+                exit_code = 1
+                shutdown_reason = f"error:{type(exc).__name__}"
+                LOG.exception("Capture shutdown failed: %s", exc)
+                safe_warning(f"Capture shutdown failed with {type(exc).__name__}: {exc}")
             finally:
                 capture.stop()
         if relay:
-            relay.stop()
+            try:
+                relay.stop()
+            except Exception as exc:
+                exit_code = 1
+                safe_warning(f"Proxy relay shutdown failed: {exc}")
         if chrome and not args.keep_chrome:
-            chrome.terminate()
+            try:
+                chrome.terminate()
+            except Exception as exc:
+                exit_code = 1
+                safe_warning(f"Chrome shutdown failed: {exc}")
         if capture and not capture_connected:
             capture.stop()
         if shutdown_reason.startswith("error:"):
             status = "error"
-        elif shutdown_reason == "cdpDisconnected" or (capture and capture.stats.get("incompleteFlushed", 0)):
+        elif shutdown_reason in {"cdpDisconnected", "chromeExited"} or (
+            capture and capture.stats.get("incompleteFlushed", 0)
+        ):
             status = "partial"
         else:
             status = "complete"
-        store.close(status=status, stats=capture.stats if capture else None)
-        print(f"Session finalized: {store.base.resolve()}")
+        try:
+            store.close(status=status, stats=capture.stats if capture else None)
+        except Exception as exc:
+            exit_code = 1
+            status = "error"
+            LOG.exception("Session finalization failed: %s", exc)
+        for signum, handler in previous_signal_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                LOG.debug("Could not restore signal handler %s", signum)
+        print(f"Session finalized: {store.base.resolve()} ({status})")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    raise SystemExit(main(sys.argv[1:]))

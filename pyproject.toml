@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chrome-network-logger"
-version = "3.0.0"
+dynamic = ["version"]
 description = "Application-layer Chrome traffic and interaction logger using browser-level CDP"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,11 +13,16 @@ authors = [{name = "Antoninnnnnnnn"}]
 keywords = ["chrome", "cdp", "network", "websocket", "debugging"]
 classifiers = [
   "Development Status :: 4 - Beta",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
 ]
 dependencies = [
   "psutil>=5.9",
@@ -26,20 +31,32 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "bandit>=1.9",
+  "build>=1.2",
   "pytest>=8",
+  "pytest-cov>=6",
   "ruff>=0.6",
+  "twine>=6",
 ]
 
 [project.urls]
 Homepage = "https://github.com/Antoninnnnnnnn/chrome-network-logger"
 Repository = "https://github.com/Antoninnnnnnnn/chrome-network-logger"
 Issues = "https://github.com/Antoninnnnnnnn/chrome-network-logger/issues"
+Documentation = "https://github.com/Antoninnnnnnnn/chrome-network-logger#readme"
+Changelog = "https://github.com/Antoninnnnnnnn/chrome-network-logger/blob/main/CHANGELOG.md"
 
 [project.scripts]
 chrome-network-logger = "chrome_logger.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["chrome_logger*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "chrome_logger.__version__"}
+
+[tool.setuptools.package-data]
+chrome_logger = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -50,4 +67,13 @@ line-length = 120
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E9", "F63", "F7", "F82"]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.coverage.run]
+branch = true
+source = ["chrome_logger"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 55

@@ -18,6 +18,24 @@ class RequestRegistry:
         self.keys_by_base: dict[str, list[str]] = {}
         self.pending_request_extra: dict[str, list[dict[str, Any]]] = {}
         self.pending_response_extra: dict[str, list[dict[str, Any]]] = {}
+        self.max_pending_bases = 10_000
+        self.max_pending_per_base = 32
+        self.dropped_extra = 0
+
+    def _queue_extra(
+        self,
+        container: dict[str, list[dict[str, Any]]],
+        base: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if base not in container and len(container) >= self.max_pending_bases:
+            oldest = next(iter(container))
+            self.dropped_extra += len(container.pop(oldest))
+        queue = container.setdefault(base, [])
+        if len(queue) >= self.max_pending_per_base:
+            queue.pop(0)
+            self.dropped_extra += 1
+        queue.append(payload)
 
     @staticmethod
     def base_key(session_id: str | None, request_id: str) -> str:
@@ -113,10 +131,10 @@ class RequestRegistry:
     ) -> str | None:
         base = self.base_key(session_id, request_id)
         if side == "request":
-            self.pending_request_extra.setdefault(base, []).append(payload)
+            self._queue_extra(self.pending_request_extra, base, payload)
             assigned = self._drain_request_extra(base)
         elif side == "response":
-            self.pending_response_extra.setdefault(base, []).append(payload)
+            self._queue_extra(self.pending_response_extra, base, payload)
             assigned = self._drain_response_extra(base)
         else:
             raise ValueError(f"Unknown ExtraInfo side: {side}")

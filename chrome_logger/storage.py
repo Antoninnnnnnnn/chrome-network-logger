@@ -10,6 +10,8 @@ import logging
 import mimetypes
 import os
 import queue
+import re
+import secrets
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +35,17 @@ _TEXT_MIMES = {
     "application/graphql-response+json",
     "application/x-www-form-urlencoded",
     "image/svg+xml",
+}
+_CHARSET = re.compile(r"(?i)(?:^|;)\s*charset\s*=\s*[\"']?([^;\s\"']+)")
+_SAFE_TEXT_ENCODINGS = {
+    "ascii",
+    "iso8859-1",
+    "utf-8",
+    "utf-8-sig",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "windows-1252",
 }
 
 
@@ -66,7 +79,12 @@ def _safe_extension(content_type: str | None, textual: bool) -> str:
 
 def _is_textual(content_type: str | None, raw: bytes) -> bool:
     ctype = (content_type or "").split(";", 1)[0].strip().lower()
-    if ctype.startswith(_TEXT_MIME_PREFIXES) or ctype in _TEXT_MIMES or ctype.endswith("+json") or ctype.endswith("+xml"):
+    if (
+        ctype.startswith(_TEXT_MIME_PREFIXES)
+        or ctype in _TEXT_MIMES
+        or ctype.endswith("+json")
+        or ctype.endswith("+xml")
+    ):
         return True
     if b"\x00" in raw[:4096]:
         return False
@@ -81,6 +99,29 @@ def _is_textual(content_type: str | None, raw: bytes) -> bool:
         return False
 
 
+def _text_encoding(content_type: str | None, raw: bytes) -> str:
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    match = _CHARSET.search(content_type or "")
+    if not match:
+        return "utf-8"
+    candidate = match.group(1).casefold().replace("_", "-")
+    aliases = {"latin-1": "iso8859-1", "iso-8859-1": "iso8859-1", "cp1252": "windows-1252"}
+    candidate = aliases.get(candidate, candidate)
+    return candidate if candidate in _SAFE_TEXT_ENCODINGS else "utf-8"
+
+
+def _csv_safe(value: Any) -> Any:
+    """Prevent captured attacker-controlled text from becoming a spreadsheet formula."""
+    if not isinstance(value, str):
+        return value
+    if value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
 class CaptureStore:
     """Canonical session store with one writer thread and external body files."""
 
@@ -88,7 +129,7 @@ class CaptureStore:
         self.config = config
         self.redactor = redactor
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        self.base = config.output_parent / f"session_{stamp}"
+        self.base = config.output_parent / f"session_{stamp}_{os.getpid()}_{secrets.token_hex(2)}"
         self.paths = {
             "network": self.base / "network",
             "bodies": self.base / "network" / "bodies",
@@ -104,9 +145,15 @@ class CaptureStore:
         self._thread = threading.Thread(target=self._writer_loop, name="capture-writer", daemon=True)
         self._body_lock = threading.Lock()
         self._body_paths: dict[str, tuple[str, bool]] = {}
+        self._stored_body_bytes = 0
+        self._omitted_body_bytes = 0
+        self._omitted_body_count = 0
+        self._body_limit_warning_emitted = False
         self._manifest_lock = threading.RLock()
         self._writer_error: BaseException | None = None
         self._closed = False
+        self._queue_high_watermark = 0
+        self._tasks_written = 0
         self._manifest: dict[str, Any] = {
             "schemaVersion": 3,
             "loggerVersion": __version__,
@@ -116,6 +163,7 @@ class CaptureStore:
                 "bodyMode": config.body_mode,
                 "sensitiveMode": config.sensitive_mode,
                 "maxBodyBytes": config.max_body_bytes,
+                "maxSessionBodyBytes": config.max_session_body_bytes,
                 "captureInteractions": config.capture_interactions,
                 "captureClipboard": config.capture_clipboard,
                 "captureConsole": config.capture_console,
@@ -186,10 +234,12 @@ class CaptureStore:
         original_size = len(raw)
         textual = _is_textual(content_type, raw)
         redacted = False
+        text_encoding = _text_encoding(content_type, raw) if textual else None
         if textual and self.redactor.enabled:
-            text = raw.decode("utf-8", errors="replace")
+            encoding = text_encoding or "utf-8"
+            text = raw.decode(encoding, errors="replace")
             clean = self.redactor.body_text(text, content_type)
-            raw = clean.encode("utf-8")
+            raw = clean.encode(encoding, errors="replace")
             redacted = clean != text
 
         processed_size = len(raw)
@@ -203,16 +253,25 @@ class CaptureStore:
         compress = textual and self.config.compress_text_bodies
         filename = f"{digest}{ext}{'.gz' if compress else ''}"
         relative_path = f"network/bodies/{filename}"
+        omitted_for_session_limit = False
         with self._body_lock:
             existing = self._body_paths.get(digest)
             if existing is None:
-                self._body_paths[digest] = (relative_path, compress)
-                self._put(("write_body", relative_path, raw, compress))
+                if (
+                    self.config.max_session_body_bytes
+                    and self._stored_body_bytes + len(raw) > self.config.max_session_body_bytes
+                ):
+                    omitted_for_session_limit = True
+                    self._omitted_body_bytes += len(raw)
+                    self._omitted_body_count += 1
+                else:
+                    self._body_paths[digest] = (relative_path, compress)
+                    self._stored_body_bytes += len(raw)
+                    self._put(("write_body", relative_path, raw, compress))
             else:
                 relative_path, compress = existing
 
         result: dict[str, Any] = {
-            "path": relative_path,
             "sha256": digest,
             "storedSha256": stored_digest,
             "storedBytes": len(raw),
@@ -225,18 +284,44 @@ class CaptureStore:
             "redacted": redacted,
             "role": role,
         }
+        if omitted_for_session_limit:
+            result["wouldStoreBytes"] = result["storedBytes"]
+            result["storedBytes"] = 0
+            result["omitted"] = True
+            result["omittedReason"] = "sessionBodyLimit"
+            if not self._body_limit_warning_emitted:
+                self._body_limit_warning_emitted = True
+                self.add_warning(
+                    "The session body storage limit was reached; later unique bodies were recorded as omitted"
+                )
+        else:
+            result["path"] = relative_path
         if decode_error:
             result["decodeError"] = decode_error
-        if textual and len(raw) <= self.config.body_inline_limit:
-            result["preview"] = raw.decode("utf-8", errors="replace")
+        if text_encoding:
+            result["encoding"] = text_encoding
+        if textual and not omitted_for_session_limit and len(raw) <= self.config.body_inline_limit:
+            result["preview"] = raw.decode(text_encoding or "utf-8", errors="replace")
         return result
 
     def _put(self, task: Any) -> None:
         if self._closed:
             raise RuntimeError("CaptureStore is closed")
+        while True:
+            self.check_health()
+            try:
+                self._queue.put(task, timeout=0.25)
+                self._queue_high_watermark = max(self._queue_high_watermark, self._queue.qsize())
+                self.check_health()
+                return
+            except queue.Full:
+                continue
+
+    def check_health(self) -> None:
         if self._writer_error:
             raise RuntimeError("Capture writer failed") from self._writer_error
-        self._queue.put(task)
+        if self._thread.ident is not None and not self._thread.is_alive() and not self._closed:
+            raise RuntimeError("Capture writer stopped unexpectedly")
 
     def _writer_loop(self) -> None:
         handles: dict[str, Any] = {}
@@ -271,6 +356,7 @@ class CaptureStore:
                             os.replace(temp, target)
                     else:
                         raise ValueError(f"Unknown writer task: {kind}")
+                    self._tasks_written += 1
                 finally:
                     self._queue.task_done()
         except BaseException as exc:  # keep the error for the producer thread
@@ -290,13 +376,17 @@ class CaptureStore:
                 try:
                     handle.flush()
                     handle.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    LOG.debug("Could not close capture output handle: %s", exc)
 
     def flush(self) -> None:
-        self._queue.join()
-        if self._writer_error:
-            raise RuntimeError("Capture writer failed") from self._writer_error
+        while True:
+            self.check_health()
+            with self._queue.all_tasks_done:
+                if self._queue.unfinished_tasks == 0:
+                    break
+                self._queue.all_tasks_done.wait(timeout=0.25)
+        self.check_health()
 
     def generate_reports(self) -> None:
         self.flush()
@@ -307,9 +397,10 @@ class CaptureStore:
         total = 0
         api_total = 0
         failures = 0
-        with open(summary, "w", encoding="utf-8") as summary_file, open(
-            csv_path, "w", encoding="utf-8", newline=""
-        ) as csv_file:
+        with (
+            open(summary, "w", encoding="utf-8") as summary_file,
+            open(csv_path, "w", encoding="utf-8", newline="") as csv_file,
+        ):
             writer = csv.DictWriter(
                 csv_file,
                 fieldnames=["id", "type", "method", "status", "is_api", "failed", "url", "response_body"],
@@ -341,14 +432,14 @@ class CaptureStore:
                         )
                         writer.writerow(
                             {
-                                "id": entry.get("id"),
-                                "type": resource_type,
-                                "method": method,
+                                "id": _csv_safe(entry.get("id")),
+                                "type": _csv_safe(resource_type),
+                                "method": _csv_safe(method),
                                 "status": status,
                                 "is_api": is_api,
                                 "failed": failed,
-                                "url": url,
-                                "response_body": body_path,
+                                "url": _csv_safe(url),
+                                "response_body": _csv_safe(body_path),
                             }
                         )
         stats_lines = [
@@ -371,7 +462,7 @@ class CaptureStore:
         target = self.base / "reports" / "interactions.html"
         with open(target, "w", encoding="utf-8") as report:
             report.write(
-                "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+                '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
                 "<title>Interaction report</title>"
                 "<style>body{font-family:system-ui,sans-serif;max-width:1200px;margin:2rem auto;padding:0 1rem}"
                 "pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f5f5;padding:1rem}"
@@ -388,26 +479,57 @@ class CaptureStore:
                     except Exception:
                         pretty = line
                     report.write(
-                        f"<details><summary>Event {index + 1}</summary>"
-                        f"<pre>{html.escape(pretty)}</pre></details>\n"
+                        f"<details><summary>Event {index + 1}</summary><pre>{html.escape(pretty)}</pre></details>\n"
                     )
             report.write("</body></html>\n")
 
     def close(self, *, status: str = "complete", stats: dict[str, Any] | None = None) -> None:
         if self._closed:
             return
+        failure: BaseException | None = None
         try:
             self.flush()
             self.generate_reports()
+        except BaseException as exc:
+            failure = exc
+            status = "error"
+            LOG.exception("Capture finalization failed")
         finally:
-            with self._manifest_lock:
-                self._manifest["endedAt"] = _now_iso()
-                self._manifest["status"] = status
-                if stats is not None:
-                    self._manifest["stats"] = stats
-                self._write_manifest_atomic()
-            self._closed = True
-            self._queue.put(_SENTINEL)
-            self._thread.join(timeout=5)
-            if self._thread.is_alive():
-                LOG.error("Writer thread did not stop cleanly")
+            try:
+                with self._manifest_lock:
+                    self._manifest["endedAt"] = _now_iso()
+                    self._manifest["status"] = status
+                    if stats is not None:
+                        self._manifest["stats"] = stats
+                    self._manifest["writer"] = {
+                        "tasksWritten": self._tasks_written,
+                        "queueHighWatermark": self._queue_high_watermark,
+                        "error": str(self._writer_error) if self._writer_error else None,
+                    }
+                    self._manifest["bodyStorage"] = {
+                        "uniqueBodies": len(self._body_paths),
+                        "storedBytes": self._stored_body_bytes,
+                        "omittedBodies": self._omitted_body_count,
+                        "omittedBytes": self._omitted_body_bytes,
+                    }
+                    if failure:
+                        warning = f"Finalization failed with {type(failure).__name__}: {failure}"
+                        warnings = self._manifest.setdefault("warnings", [])
+                        if warning not in warnings:
+                            warnings.append(warning)
+                    self._write_manifest_atomic()
+            except BaseException as exc:
+                failure = failure or exc
+            finally:
+                self._closed = True
+                if self._thread.is_alive():
+                    try:
+                        self._queue.put(_SENTINEL, timeout=1)
+                    except queue.Full:
+                        failure = failure or RuntimeError("Writer queue did not accept shutdown sentinel")
+                    self._thread.join(timeout=5)
+                if self._thread.is_alive():
+                    LOG.error("Writer thread did not stop cleanly")
+                    failure = failure or RuntimeError("Writer thread did not stop cleanly")
+        if failure:
+            raise RuntimeError("Capture finalization failed") from failure

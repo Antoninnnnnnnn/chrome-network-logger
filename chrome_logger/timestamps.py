@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 from datetime import datetime
@@ -12,6 +13,8 @@ class TimestampMapper:
         self._lock = threading.Lock()
 
     def normalize(self, monotonic_seconds: float | None = None, wall_seconds: float | None = None) -> dict[str, Any]:
+        monotonic_seconds = self._finite(monotonic_seconds)
+        wall_seconds = self._finite(wall_seconds)
         with self._lock:
             if monotonic_seconds is not None and wall_seconds is not None:
                 candidate = float(wall_seconds) - float(monotonic_seconds)
@@ -32,8 +35,19 @@ class TimestampMapper:
         return result
 
     def from_epoch_ms(self, epoch_ms: int | float | None) -> dict[str, Any]:
-        epoch = float(epoch_ms) / 1000 if epoch_ms is not None else time.time()
+        finite_ms = self._finite(epoch_ms)
+        epoch = finite_ms / 1000 if finite_ms is not None else time.time()
         return {
             "epochMs": round(epoch * 1000),
             "iso": datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="milliseconds"),
         }
+
+    @staticmethod
+    def _finite(value: int | float | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if math.isfinite(parsed) else None

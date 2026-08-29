@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible logger defect using synthetic data
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not attach real captures, credentials, cookies, profiles, or proxy secrets.
+        Report security vulnerabilities privately through SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: Logger version
+      placeholder: "chrome-network-logger 3.0.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, Python version, and Chrome/Chromium version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Synthetic reproduction
+      description: Minimal commands and synthetic inputs that reproduce the issue
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I removed credentials, cookies, tokens, private URLs, profiles, and third-party data.
+          required: true
+        - label: This report is not a security vulnerability.
+          required: true

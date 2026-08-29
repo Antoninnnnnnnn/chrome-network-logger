@@ -7,10 +7,12 @@ import secrets
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import websocket
 
 from .browser_capture import BrowserCaptureMixin
+from .chrome import fetch_json
 from .config import CaptureConfig
 from .constants import PAGE_TYPES, TARGET_TYPES
 from .models import PendingCommand
@@ -32,6 +34,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
         self.running = threading.Event()
         self.running.set()
         self.connection_closed = threading.Event()
+        self.failure = threading.Event()
+        self.fatal_error: BaseException | None = None
         self.thread: threading.Thread | None = None
         self.send_lock = threading.Lock()
         self.state_lock = threading.RLock()
@@ -52,7 +56,9 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
         self.timestamps = TimestampMapper()
         self.binding_name = "__cnl_" + secrets.token_hex(8)
         self.install_marker = "__cnl_installed_" + secrets.token_hex(8)
+        self.world_name = "__cnl_world_" + secrets.token_hex(8)
         self.interaction_script_ids: dict[str, str] = {}
+        self.interaction_contexts: dict[str, set[int]] = {}
         self._snapshot_condition = threading.Condition(self.state_lock)
         self._quiesce_condition = threading.Condition(self.state_lock)
         self._quiesce_pending = 0
@@ -69,18 +75,36 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             "sseMessages": 0,
             "webTransports": 0,
             "userEvents": 0,
+            "droppedUserEvents": 0,
+            "eventErrors": 0,
+            "protocolErrors": 0,
+            "droppedExtraInfo": 0,
             "incompleteFlushed": 0,
         }
 
+    def _fail_capture(self, message: str, error: BaseException | None = None) -> None:
+        if self.failure.is_set():
+            return
+        self.fatal_error = error or RuntimeError(message)
+        self.failure.set()
+        try:
+            self.store.add_warning(message)
+        except Exception:
+            LOG.exception("Could not persist capture failure warning")
+
     def connect(self) -> bool:
         try:
-            import urllib.request
-
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/version", timeout=3) as response:
-                version = json.loads(response.read())
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=3) as response:
-                initial_targets = json.loads(response.read())
-            self.ws = websocket.create_connection(version["webSocketDebuggerUrl"], timeout=0.2)
+            version = fetch_json(self.port, "/json/version")
+            initial_targets = fetch_json(self.port, "/json")
+            debugger_url = str(version["webSocketDebuggerUrl"])
+            parsed = urlsplit(debugger_url)
+            if (
+                parsed.scheme != "ws"
+                or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or parsed.port != self.port
+            ):
+                raise RuntimeError(f"Chrome returned an unsafe debugger URL: {debugger_url!r}")
+            self.ws = websocket.create_connection(debugger_url, timeout=0.2, suppress_origin=True)
         except Exception as exc:
             LOG.error("Could not connect to browser-level CDP: %s", exc)
             return False
@@ -95,7 +119,15 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             }
         )
         target_filter = [{"type": item} for item in sorted(TARGET_TYPES)]
-        self.send("Target.setDiscoverTargets", {"discover": True, "filter": target_filter})
+        self.send(
+            "Target.setDiscoverTargets",
+            {"discover": True, "filter": target_filter},
+            pending=PendingCommand(
+                "required_command",
+                {"method": "Target.setDiscoverTargets", "sessionId": None},
+                time.monotonic(),
+            ),
+        )
         self.send(
             "Target.setAutoAttach",
             {
@@ -104,6 +136,11 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 "flatten": True,
                 "filter": target_filter,
             },
+            pending=PendingCommand(
+                "required_command",
+                {"method": "Target.setAutoAttach", "sessionId": None},
+                time.monotonic(),
+            ),
         )
         for target in initial_targets:
             if target.get("type") in TARGET_TYPES and target.get("id"):
@@ -244,6 +281,13 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 },
                 redact=True,
             )
+        elif kind == "required_command":
+            method = str(data.get("method") or "unknown")
+            self.stats["protocolErrors"] += 1
+            self._fail_capture(f"Required CDP command failed: {method}: {error}", RuntimeError(str(error)))
+        elif kind == "interaction_binding":
+            self.stats["protocolErrors"] += 1
+            self.store.add_warning(f"Interaction capture binding failed for session {data.get('sessionId')}: {error}")
 
     def _attach_target(self, target_id: str) -> None:
         with self.state_lock:
@@ -294,8 +338,25 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             "maxResourceBufferSize": self.config.max_resource_buffer,
             "maxPostDataSize": self.config.max_post_data,
         }
-        self.send("Network.enable", network_options, session_id)
-        self.send("Runtime.enable", session_id=session_id)
+        self.send(
+            "Network.enable",
+            network_options,
+            session_id,
+            PendingCommand(
+                "required_command",
+                {"method": "Network.enable", "sessionId": session_id},
+                time.monotonic(),
+            ),
+        )
+        self.send(
+            "Runtime.enable",
+            session_id=session_id,
+            pending=PendingCommand(
+                "required_command",
+                {"method": "Runtime.enable", "sessionId": session_id},
+                time.monotonic(),
+            ),
+        )
         if self.config.capture_console:
             self.send("Log.enable", session_id=session_id)
         target_filter = [{"type": item} for item in sorted(TARGET_TYPES)]
@@ -308,9 +369,22 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 "filter": target_filter,
             },
             session_id,
+            PendingCommand(
+                "required_command",
+                {"method": "Target.setAutoAttach", "sessionId": session_id},
+                time.monotonic(),
+            ),
         )
         if target_info.get("type") in PAGE_TYPES:
-            self.send("Page.enable", session_id=session_id)
+            self.send(
+                "Page.enable",
+                session_id=session_id,
+                pending=PendingCommand(
+                    "required_command",
+                    {"method": "Page.enable", "sessionId": session_id},
+                    time.monotonic(),
+                ),
+            )
             if self.config.body_mode != "none":
                 self.send(
                     "Fetch.enable",
@@ -325,17 +399,26 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                         "handleAuthRequests": False,
                     },
                     session_id,
+                    PendingCommand(
+                        "required_command",
+                        {"method": "Fetch.enable", "sessionId": session_id},
+                        time.monotonic(),
+                    ),
                 )
             if self.config.capture_interactions:
                 script = self._interaction_script()
-                self.send("Runtime.addBinding", {"name": self.binding_name}, session_id)
+                self.send(
+                    "Runtime.addBinding",
+                    {"name": self.binding_name, "executionContextName": self.world_name},
+                    session_id,
+                    PendingCommand("interaction_binding", {"sessionId": session_id}, time.monotonic()),
+                )
                 self.send(
                     "Page.addScriptToEvaluateOnNewDocument",
-                    {"source": script},
+                    {"source": script, "worldName": self.world_name, "runImmediately": True},
                     session_id,
                     PendingCommand("interaction_script", {"sessionId": session_id}, time.monotonic()),
                 )
-                self.send("Runtime.evaluate", {"expression": script}, session_id)
         self.send(
             "Runtime.runIfWaitingForDebugger",
             {},
@@ -428,10 +511,12 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 self._request_will_be_sent(session_id, params)
             elif method == "Network.requestWillBeSentExtraInfo":
                 self._request_extra(session_id, params)
+                self.stats["droppedExtraInfo"] = self.registry.dropped_extra
             elif method == "Network.responseReceived":
                 self._response_received(session_id, params)
             elif method == "Network.responseReceivedExtraInfo":
                 self._response_extra(session_id, params)
+                self.stats["droppedExtraInfo"] = self.registry.dropped_extra
             elif method == "Network.responseReceivedEarlyHints":
                 self._response_early_hints(session_id, params)
             elif method == "Network.requestServedFromCache":
@@ -462,6 +547,19 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 self._webtransport_established(session_id, params)
             elif method == "Network.webTransportClosed":
                 self._webtransport_closed(session_id, params)
+            elif method == "Runtime.executionContextCreated":
+                context = params.get("context") or {}
+                if context.get("name") == self.world_name and context.get("id") is not None:
+                    with self.state_lock:
+                        self.interaction_contexts.setdefault(session_id or "", set()).add(int(context["id"]))
+            elif method == "Runtime.executionContextDestroyed":
+                context_id = params.get("executionContextId")
+                if context_id is not None:
+                    with self.state_lock:
+                        self.interaction_contexts.setdefault(session_id or "", set()).discard(int(context_id))
+            elif method == "Runtime.executionContextsCleared":
+                with self.state_lock:
+                    self.interaction_contexts.pop(session_id or "", None)
             elif method == "Runtime.bindingCalled" and params.get("name") == self.binding_name:
                 self._user_event(session_id, params)
             elif method == "Runtime.consoleAPICalled" and self.config.capture_console:
@@ -474,8 +572,15 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 self._navigation_event(session_id, "frameNavigated", params)
             elif method in {"Page.frameStartedLoading", "Page.frameStoppedLoading"}:
                 self._navigation_event(session_id, method.rsplit(".", 1)[-1], params)
-        except Exception:
+        except Exception as exc:
+            self.stats["eventErrors"] += 1
             LOG.exception("Failed to handle CDP event %s", method)
+            try:
+                self.store.check_health()
+            except Exception as store_exc:
+                self._fail_capture("Capture storage failed while handling a CDP event", store_exc)
+            if self.stats["eventErrors"] >= 25:
+                self._fail_capture("Too many CDP event handler errors", exc)
 
     def _handle_command_response(self, message: dict[str, Any]) -> None:
         message_id = int(message["id"])
@@ -519,6 +624,28 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                     },
                     redact=True,
                 )
+            return
+        if kind == "required_command":
+            if error:
+                method = str(data.get("method") or "unknown")
+                self.stats["protocolErrors"] += 1
+                self.store.write_jsonl(
+                    "browser/protocol_errors.jsonl",
+                    {
+                        "time": self.timestamps.normalize(),
+                        "method": method,
+                        "sessionId": data.get("sessionId"),
+                        "required": True,
+                        "error": error,
+                    },
+                    redact=True,
+                )
+                self._fail_capture(f"Required CDP command failed: {method}: {error}", RuntimeError(str(error)))
+            return
+        if kind == "interaction_binding":
+            if error:
+                self.stats["protocolErrors"] += 1
+                self.store.add_warning(f"Interaction binding unavailable for session {data.get('sessionId')}: {error}")
             return
         if kind == "interaction_script":
             session_id = str(data.get("sessionId") or "")
@@ -741,6 +868,13 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                     },
                     redact=True,
                 )
+            elif kind == "required_command":
+                method = str(data.get("method") or "unknown")
+                self.stats["protocolErrors"] += 1
+                self._fail_capture(f"Required CDP command timed out: {method}", TimeoutError(method))
+            elif kind == "interaction_binding":
+                self.stats["protocolErrors"] += 1
+                self.store.add_warning(f"Interaction binding timed out for session {data.get('sessionId')}")
 
     def _process_target_fallbacks(self) -> None:
         now = time.monotonic()
@@ -791,6 +925,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                     self.webtransports.pop(key, None)
             target = self.targets.pop(session_id, None)
             self.interaction_script_ids.pop(session_id, None)
+            self.interaction_contexts.pop(session_id, None)
             self.enabled_sessions.discard(session_id)
             if target and target.get("targetId"):
                 target_id = str(target["targetId"])
@@ -798,10 +933,15 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 self.attached_targets.discard(target_id)
         self.store.write_jsonl(
             "browser/targets.jsonl",
-            {"event": "detached", "sessionId": session_id, "target": target, "reason": reason, "time": self.timestamps.normalize()},
+            {
+                "event": "detached",
+                "sessionId": session_id,
+                "target": target,
+                "reason": reason,
+                "time": self.timestamps.normalize(),
+            },
             redact=True,
         )
-
 
     def wait_for_pending_data(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -872,6 +1012,9 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                     )
             sessions = list(self.targets.items())
             script_ids = dict(self.interaction_script_ids)
+            interaction_contexts = {
+                session_id: set(contexts) for session_id, contexts in self.interaction_contexts.items()
+            }
         for fetch_id, (session_id, _) in paused.items():
             self._send_quiesce("Fetch.continueResponse", {"requestId": fetch_id}, session_id)
         auto_attach_off = {
@@ -884,7 +1027,12 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 if self.config.body_mode != "none":
                     self._send_quiesce("Fetch.disable", {}, session_id)
                 if self.config.capture_interactions:
-                    self._send_quiesce("Runtime.evaluate", {"expression": teardown}, session_id)
+                    for context_id in interaction_contexts.get(session_id, set()):
+                        self._send_quiesce(
+                            "Runtime.evaluate",
+                            {"expression": teardown, "contextId": context_id},
+                            session_id,
+                        )
                     identifier = script_ids.get(session_id)
                     if identifier:
                         self._send_quiesce(
@@ -933,9 +1081,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
         if self.ws:
             try:
                 self.ws.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                LOG.debug("Could not close the CDP WebSocket cleanly: %s", exc)
         if self.thread and self.thread is not threading.current_thread():
             self.thread.join(timeout=3)
-
-

@@ -4,8 +4,8 @@ import copy
 import hashlib
 import hmac
 import json
-import secrets
 import re
+import secrets
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -131,7 +131,9 @@ _RAW_HEADER_LINE = re.compile(
     r"x-api-key|x-auth-token|x-csrf-token)\s*:\s*)(?P<value>[^\r\n]*)"
 )
 _AUTH_VALUE = re.compile(r"(?i)(\b(?:bearer|basic)\s+)([A-Za-z0-9._~+/=-]+)")
-_JWT_VALUE = re.compile(r"(?<![A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,})(?![A-Za-z0-9_-])")
+_JWT_VALUE = re.compile(
+    r"(?<![A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,})(?![A-Za-z0-9_-])"
+)
 _KEY_VALUE = re.compile(
     r"(?i)(\b(?:password|passwd|pwd|secret|client[_-]?secret|access[_-]?token|"
     r"refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|csrf|xsrf|otp|pin|cvv|cvc|"
@@ -145,9 +147,13 @@ _ALREADY_REDACTED = re.compile(
 
 _JSON_SECRET = re.compile(
     r'(?i)(["\'](?:password|passwd|pwd|secret|client[_-]?secret|access[_-]?token|'
-    r'refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|csrf|xsrf|otp|pin|cvv|cvc|'
-    r'card[_-]?(?:number|no|num)|credit[_-]?card|credential|assertion|jwt|'
+    r"refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|csrf|xsrf|otp|pin|cvv|cvc|"
+    r"card[_-]?(?:number|no|num)|credit[_-]?card|credential|assertion|jwt|"
     r'auth[_-]?code|sessionid)["\']\s*:\s*["\'])(.*?)(["\'])'
+)
+_HTML_SENSITIVE_ATTRIBUTE = re.compile(
+    r"(?i)(\b(?:value|srcdoc)\s*=\s*)(?P<quote>[\"']?)(?P<value>.*?)(?P=quote)(?=\s|/?>)",
+    re.DOTALL,
 )
 
 
@@ -190,8 +196,10 @@ def _fingerprint(value: Any, key: bytes) -> str:
 
 def _looks_like_cookie(value: dict[str, Any]) -> bool:
     lowered = {str(key).casefold() for key in value}
-    return "name" in lowered and "value" in lowered and bool(
-        lowered.intersection({"domain", "path", "expires", "sameparty", "samesite", "httponly", "secure"})
+    return (
+        "name" in lowered
+        and "value" in lowered
+        and bool(lowered.intersection({"domain", "path", "expires", "sameparty", "samesite", "httponly", "secure"}))
     )
 
 
@@ -217,9 +225,7 @@ class Redactor:
         result: dict[str, Any] = {}
         for key, value in headers.items():
             result[str(key)] = (
-                self.value(value)
-                if _is_sensitive_key(key, preserve_protocol_ids=False)
-                else self.object(value)
+                self.value(value) if _is_sensitive_key(key, preserve_protocol_ids=False) else self.object(value)
             )
         return result
 
@@ -231,9 +237,7 @@ class Redactor:
             redacted = [
                 (
                     key,
-                    str(self.value(item))
-                    if _is_sensitive_url_parameter(key)
-                    else item,
+                    str(self.value(item)) if _is_sensitive_url_parameter(key) else item,
                 )
                 for key, item in items
             ]
@@ -246,6 +250,8 @@ class Redactor:
             return url
         try:
             parts = urlsplit(url)
+            if parts.scheme.casefold() in {"data", "javascript"}:
+                return str(self.value(url))
             query = self._redact_parameters(parts.query)
             fragment = parts.fragment
             # OAuth implicit-flow and callback fragments often contain
@@ -287,7 +293,11 @@ class Redactor:
 
         parent_normalized = _normalized_key(parent_key or "")
         cookie_context = parent_normalized in _COOKIE_CONTAINER_KEYS
-        if parent_key and _is_sensitive_key(parent_key, preserve_protocol_ids=preserve_protocol_ids) and not cookie_context:
+        if (
+            parent_key
+            and _is_sensitive_key(parent_key, preserve_protocol_ids=preserve_protocol_ids)
+            and not cookie_context
+        ):
             return self.value(value)
 
         if isinstance(value, dict):
@@ -306,6 +316,9 @@ class Redactor:
                     "newurl",
                     "href",
                     "action",
+                    "src",
+                    "formaction",
+                    "poster",
                     "urlfragment",
                 } and isinstance(item, str):
                     out[key_s] = self.url(item) if normalized != "urlfragment" else self._redact_parameters(item)
@@ -328,13 +341,11 @@ class Redactor:
             return out
         if isinstance(value, list):
             return [
-                self.object(item, parent_key=parent_key, preserve_protocol_ids=preserve_protocol_ids)
-                for item in value
+                self.object(item, parent_key=parent_key, preserve_protocol_ids=preserve_protocol_ids) for item in value
             ]
         if isinstance(value, tuple):
             return [
-                self.object(item, parent_key=parent_key, preserve_protocol_ids=preserve_protocol_ids)
-                for item in value
+                self.object(item, parent_key=parent_key, preserve_protocol_ids=preserve_protocol_ids) for item in value
             ]
         if isinstance(value, str):
             return self.text(value)
@@ -354,6 +365,12 @@ class Redactor:
             lambda match: match.group(1) + str(self.value(match.group(2))) + match.group(3),
             result,
         )
+        result = _HTML_SENSITIVE_ATTRIBUTE.sub(
+            lambda match: (
+                match.group(1) + match.group("quote") + str(self.value(match.group("value"))) + match.group("quote")
+            ),
+            result,
+        )
         return result
 
     def _redact_multipart(self, text: str, content_type: str) -> str | None:
@@ -366,9 +383,7 @@ class Redactor:
         if len(chunks) < 3:
             return None
         output = [chunks[0]]
-        disposition = re.compile(
-            r"(?im)^Content-Disposition:[^\r\n]*\bname=(?:\"([^\"]*)\"|([^;\r\n]+))"
-        )
+        disposition = re.compile(r"(?im)^Content-Disposition:[^\r\n]*\bname=(?:\"([^\"]*)\"|([^;\r\n]+))")
         for chunk in chunks[1:]:
             if chunk.startswith("--"):
                 output.append(delimiter + chunk)
@@ -379,7 +394,9 @@ class Redactor:
                 continue
             headers, body = chunk.split(separator, 1)
             match = disposition.search(headers)
-            if match and _is_sensitive_key((match.group(1) or match.group(2) or "").strip(), preserve_protocol_ids=False):
+            if match and _is_sensitive_key(
+                (match.group(1) or match.group(2) or "").strip(), preserve_protocol_ids=False
+            ):
                 trailing = ""
                 while body.endswith(("\r", "\n")):
                     trailing = body[-1] + trailing
@@ -401,8 +418,8 @@ class Redactor:
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
-            except Exception:
-                pass
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parsed = None
         if "application/x-www-form-urlencoded" in ctype:
             return self._redact_parameters(text)
         if "multipart/form-data" in ctype:
@@ -428,5 +445,5 @@ class Redactor:
                 if isinstance(attrs, dict) and "value" in attrs:
                     attrs["value"] = self.value(attrs["value"])
                 if "outerHTML" in target:
-                    target["outerHTML"] = f"<{target.get('tag', 'element')} data-sensitive-redacted=\"true\">"
+                    target["outerHTML"] = f'<{target.get("tag", "element")} data-sensitive-redacted="true">'
         return clean

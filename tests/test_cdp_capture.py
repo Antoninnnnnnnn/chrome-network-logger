@@ -39,6 +39,9 @@ class FakeStore:
     def add_warning(self, warning: str) -> None:
         self.warnings.append(warning)
 
+    def check_health(self) -> None:
+        return None
+
 
 def make_capture(tmp_path: Path, *, body_mode: str = "api") -> tuple[CDPCapture, FakeStore]:
     store = FakeStore()
@@ -333,9 +336,240 @@ def test_realtime_payload_respects_smaller_max_body_limit(tmp_path: Path) -> Non
     )
     assert store.writes[-1][1]["payload"]["role"] == "websocket-frame"
     assert store.bodies[-1]["body"] == "abcdefgh"
-
     capture._sse_message(
         "s",
         {"requestId": "2", "timestamp": 11.0, "eventName": "message", "data": "abcdefgh"},
     )
     assert store.writes[-1][1]["dataBody"]["role"] == "sse-message"
+
+
+def test_interaction_binding_accepts_only_the_isolated_world_and_limits_payloads(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    capture.interaction_contexts["s"] = {7}
+    payload = '{"event":"click","ts":1700000000000}'
+
+    capture._user_event("s", {"executionContextId": 8, "payload": payload})
+    assert capture.stats["droppedUserEvents"] == 1
+    assert not store.writes
+
+    capture._user_event("s", {"executionContextId": 7, "payload": payload})
+    assert store.writes[-1][0] == "interactions/events.jsonl"
+
+    capture.config.max_interaction_payload_bytes = 10
+    capture._user_event("s", {"executionContextId": 7, "payload": payload})
+    assert capture.stats["droppedUserEvents"] == 2
+    assert store.warnings
+
+
+def test_required_cdp_command_failure_marks_capture_unhealthy(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    capture.pending[1] = PendingCommand(
+        "required_command",
+        {"method": "Network.enable", "sessionId": "s"},
+        time.monotonic(),
+    )
+    capture._handle_command_response({"id": 1, "error": {"code": -1, "message": "unsupported"}})
+    assert capture.failure.is_set()
+    assert capture.stats["protocolErrors"] == 1
+    assert any("Required CDP command failed" in warning for warning in store.warnings)
+
+
+def test_connect_rejects_non_loopback_debugger_url(monkeypatch, tmp_path: Path) -> None:
+    capture, _ = make_capture(tmp_path)
+
+    def fake_fetch_json(_port: int, path: str):
+        if path == "/json/version":
+            return {"webSocketDebuggerUrl": "ws://attacker.example/devtools/browser/1"}
+        return []
+
+    monkeypatch.setattr("chrome_logger.cdp.fetch_json", fake_fetch_json)
+    assert capture.connect() is False
+    assert capture.ws is None
+
+
+def test_page_session_enables_required_domains_and_isolated_world(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    sent: list[tuple[str, dict[str, Any], str | None, PendingCommand | None]] = []
+
+    def record_send(method, params=None, session_id=None, pending=None):
+        sent.append((method, params or {}, session_id, pending))
+        return len(sent)
+
+    capture.send = record_send  # type: ignore[method-assign]
+    target = {"targetId": "target-1", "type": "page", "url": "https://example.test", "title": "Test"}
+    capture._enable_session("session-1", target)
+
+    methods = {method for method, _, _, _ in sent}
+    assert {"Network.enable", "Runtime.enable", "Page.enable", "Fetch.enable"} <= methods
+    required = {
+        pending.data["method"]
+        for _, _, _, pending in sent
+        if pending is not None and pending.kind == "required_command"
+    }
+    assert {"Network.enable", "Runtime.enable", "Page.enable", "Fetch.enable", "Target.setAutoAttach"} <= required
+    binding = next(item for item in sent if item[0] == "Runtime.addBinding")
+    script = next(item for item in sent if item[0] == "Page.addScriptToEvaluateOnNewDocument")
+    assert binding[1]["executionContextName"] == capture.world_name
+    assert script[1]["worldName"] == capture.world_name
+    assert script[1]["runImmediately"] is True
+    assert capture.target_sessions["target-1"] == "session-1"
+    assert any(path == "browser/targets.jsonl" for path, _ in store.writes)
+
+
+def test_browser_storage_snapshot_lifecycle(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    capture.targets["page"] = {"targetId": "target-1", "type": "page", "url": "https://example.test"}
+    next_id = 0
+
+    def pending_send(_method, _params=None, _session_id=None, pending=None):
+        nonlocal next_id
+        next_id += 1
+        if pending:
+            capture.pending[next_id] = pending
+        return next_id
+
+    capture.send = pending_send  # type: ignore[method-assign]
+    capture.snapshot("start")
+    assert capture._snapshot_pending == 2
+    commands = {command.kind: message_id for message_id, command in capture.pending.items()}
+    capture._handle_command_response(
+        {"id": commands["snapshot_cookies"], "result": {"cookies": [{"name": "sid", "value": "secret"}]}}
+    )
+    capture._handle_command_response(
+        {
+            "id": commands["snapshot_storage"],
+            "result": {"result": {"value": {"localStorage": {"ok": True, "values": {"token": "secret"}}}}},
+        }
+    )
+    assert capture.wait_for_snapshots(0.01) is True
+    assert any(path == "snapshots/cookies_start.json" for path, _ in store.writes)
+    assert any(path == "snapshots/storage_start.jsonl" for path, _ in store.writes)
+    assert "secret" not in str(store.writes)
+
+
+def test_network_request_response_and_body_command_lifecycle(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    next_id = 0
+
+    def pending_send(_method, _params=None, _session_id=None, pending=None):
+        nonlocal next_id
+        next_id += 1
+        if pending:
+            capture.pending[next_id] = pending
+        return next_id
+
+    capture.send = pending_send  # type: ignore[method-assign]
+    capture._request_will_be_sent(
+        "s",
+        {
+            "requestId": "1",
+            "timestamp": 10.0,
+            "wallTime": 1_700_000_000.0,
+            "type": "XHR",
+            "request": {"url": "https://example.test/api", "method": "GET", "headers": {}},
+        },
+    )
+    capture._request_extra("s", {"requestId": "1", "headers": {"Authorization": "Bearer secret"}})
+    capture._response_received(
+        "s",
+        {
+            "requestId": "1",
+            "type": "XHR",
+            "hasExtraInfo": False,
+            "response": {"status": 200, "headers": {"content-type": "application/json"}},
+        },
+    )
+    capture._response_early_hints("s", {"requestId": "1", "timestamp": 10.1, "headers": {"link": "x"}})
+    capture._served_from_cache("s", {"requestId": "1"})
+    capture._loading_finished("s", {"requestId": "1", "timestamp": 11.0, "encodedDataLength": 20})
+    body_message_id = next(
+        message_id for message_id, command in capture.pending.items() if command.kind == "response_body"
+    )
+    capture._handle_command_response(
+        {"id": body_message_id, "result": {"body": '{"token":"secret","ok":true}', "base64Encoded": False}}
+    )
+    for key, (_, hard, reason) in list(capture.finalize_deadlines.items()):
+        capture.finalize_deadlines[key] = (0.0, hard, reason)
+    capture._process_finalize_deadlines()
+    saved = next(payload for path, payload in store.writes if path == "network/requests.jsonl")
+    assert saved["servedFromCache"] is True
+    assert saved["response"]["body"]["role"] == "response"
+    assert "secret" not in str(saved)
+    assert capture.stats["bodies"] == 1
+
+
+def test_fetch_response_body_and_continue_lifecycle(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    next_id = 0
+    sent: list[tuple[str, dict[str, Any], str | None]] = []
+
+    def pending_send(method, params=None, session_id=None, pending=None):
+        nonlocal next_id
+        next_id += 1
+        sent.append((method, params or {}, session_id))
+        if pending:
+            capture.pending[next_id] = pending
+        return next_id
+
+    capture.send = pending_send  # type: ignore[method-assign]
+    capture._request_will_be_sent(
+        "s",
+        {
+            "requestId": "network-1",
+            "timestamp": 10.0,
+            "wallTime": 1_700_000_000.0,
+            "type": "Document",
+            "request": {"url": "https://example.test", "method": "GET", "headers": {}},
+        },
+    )
+    capture._response_received(
+        "s",
+        {
+            "requestId": "network-1",
+            "type": "Document",
+            "hasExtraInfo": False,
+            "response": {"status": 200, "headers": {}},
+        },
+    )
+    capture._fetch_paused(
+        "s",
+        {
+            "requestId": "fetch-1",
+            "networkId": "network-1",
+            "responseStatusCode": 200,
+            "responseHeaders": [{"name": "content-type", "value": "text/html"}],
+        },
+    )
+    body_message_id = next(
+        message_id for message_id, command in capture.pending.items() if command.kind == "fetch_body"
+    )
+    capture._handle_command_response(
+        {"id": body_message_id, "result": {"body": "<html>ok</html>", "base64Encoded": False}}
+    )
+    assert ("Fetch.continueResponse", {"requestId": "fetch-1"}, "s") in sent
+    assert store.bodies[-1]["content_type"] == "text/html"
+    assert not capture.paused_fetches
+
+
+def test_websocket_and_webtransport_lifecycles(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    capture.targets["s"] = {"targetId": "target-1", "type": "page", "url": "https://example.test"}
+    capture._websocket_created(
+        "s", {"requestId": "ws-1", "url": "wss://example.test/socket", "timestamp": 10.0, "initiator": {}}
+    )
+    capture._websocket_handshake_request("s", {"requestId": "ws-1", "request": {"headers": {"x": "1"}}})
+    capture._websocket_handshake_response("s", {"requestId": "ws-1", "response": {"status": 101, "headers": {}}})
+    capture._websocket_error("s", {"requestId": "ws-1", "timestamp": 10.5, "errorMessage": "synthetic"})
+    capture._websocket_closed("s", {"requestId": "ws-1", "timestamp": 11.0})
+    assert not capture.open_websockets
+    assert any(path == "realtime/websocket_connections.jsonl" for path, _ in store.writes)
+    assert any(path == "network/requests.jsonl" for path, _ in store.writes)
+
+    capture._webtransport_created(
+        "s", {"transportId": "wt-1", "url": "https://example.test/transport", "timestamp": 12.0}
+    )
+    capture._webtransport_established("s", {"transportId": "wt-1", "timestamp": 12.5})
+    capture._webtransport_closed("s", {"transportId": "wt-1", "timestamp": 13.0})
+    assert not capture.webtransports
+    assert any(path == "realtime/webtransport.jsonl" for path, _ in store.writes)
+    assert capture.stats["webTransports"] == 1

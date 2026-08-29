@@ -45,3 +45,12 @@ def test_request_extra_can_arrive_before_request_will_be_sent() -> None:
     assert registry.assign_extra("s", "9", "request", {"headers": {"x": "y"}}) is None
     key = registry.create("s", "9", {"sessionId": "s", "requestId": "9"})
     assert registry.entries[key]["extraInfo"]["request"]["headers"] == {"x": "y"}
+
+
+def test_unmatched_extra_info_is_bounded() -> None:
+    registry = RequestRegistry()
+    registry.max_pending_per_base = 2
+    for value in range(3):
+        registry.assign_extra("s", "missing", "request", {"value": value})
+    assert registry.pending_request_extra["s::missing"] == [{"value": 1}, {"value": 2}]
+    assert registry.dropped_extra == 1

@@ -1,0 +1,6 @@
+include CHANGELOG.md
+include CONTRIBUTING.md
+include README.fr.md
+include SECURITY.md
+include chrome_network_logger.py
+recursive-include docs *.md
