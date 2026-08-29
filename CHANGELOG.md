@@ -2,6 +2,20 @@
 
 All notable changes to Chrome Network Logger are documented here.
 
+## 3.1.0 — 2026-08-29
+
+### Managed Chrome fallback
+
+- Create the dedicated profile directory before browser discovery so a missing local Chrome no longer prevents profile setup.
+- Download and cache the official Stable Chrome for Testing build when no system Chrome/Chromium is available.
+- Resolve the platform from the host architecture and support Google's `win32`, `win64`, `linux64`, `mac-x64`, and `mac-arm64` archives.
+- Validate fixed HTTPS hosts and archive paths, require TLS 1.2+, bound compressed/expanded sizes and member counts, reject traversal and unsafe archive entries, extract to a temporary directory, and publish the installation atomically.
+- Persist locally computed archive/executable SHA-256 values and managed distribution details, then recheck the executable before cache reuse.
+- Add `--managed-chrome-dir`, `--no-download-chrome`, and `--refresh-managed-chrome` controls.
+- Document that this remains a genuine visible Chrome process without WebDriver, but does not promise invisibility to website fingerprinting.
+- Select a non-zero ephemeral loopback debugging port before launch because Chrome sets `navigator.webdriver=true` specifically for `--remote-debugging-port=0`; retain strict loopback endpoint validation.
+- Expand the suite to 96 tests, including managed-install caching/integrity, platform and CDP-port selection, URL allow-listing, archive traversal rejection, CLI fallback, and opt-out behavior.
+
 ## 3.0.1 — 2026-08-29
 
 ### Security hardening

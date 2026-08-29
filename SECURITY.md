@@ -8,6 +8,8 @@ Chrome Network Logger can observe application-layer data exposed by Chrome, incl
 
 Never commit captures, `capture_profile`, or proxy credentials. The repository `.gitignore` excludes their default locations, but custom paths still require care.
 
+When no local Chrome exists, the logger can cache Google's official Stable Chrome for Testing build. Use `--no-download-chrome` to prohibit this network download, or `--managed-chrome-dir` to control its location. The archive URL is restricted to Google's official HTTPS endpoints, extraction is bounded and traversal-safe, and locally computed archive/executable SHA-256 values are recorded. The executable is rechecked before reuse; initial upstream authenticity still relies on the host TLS trust store because the metadata does not publish a SHA-256 checksum.
+
 ## Reporting a vulnerability
 
 Please use [GitHub private vulnerability reporting](https://github.com/Antoninnnnnnnn/chrome-network-logger/security/advisories/new) for vulnerabilities in the logger itself. Do not include real credentials, session cookies, private captures, or third-party data in a public issue.

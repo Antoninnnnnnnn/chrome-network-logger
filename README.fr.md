@@ -27,7 +27,8 @@ Outil Python pour capturer le **trafic applicatif visible par Chrome** avec le C
 - Relay proxy réécrit : sockets correctement suivis/fermés, IPv6, proxy HTTP ou HTTPS, bascule directe en live sous Windows.
 - Les erreurs fatales CDP/writer produisent un manifeste `error` et un code de sortie non nul, sans faux succès.
 - Payloads d’interaction, `ExtraInfo` en attente, connexions proxy et file du writer sont bornés.
-- Package typé, 83 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
+- Package typé, 96 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
+- Si aucun Chrome local n’existe, téléchargement et mise en cache automatiques du Chrome for Testing Stable officiel, sans ChromeDriver.
 
 ## Installation
 
@@ -47,7 +48,7 @@ python -m build
 python -m twine check dist/*
 ```
 
-Prérequis : Python 3.10+ et Chrome ou Chromium.
+Prérequis : Python 3.10+. Un Chrome/Chromium déjà installé est utilisé en priorité ; sinon l’outil récupère le [Chrome for Testing Stable officiel](https://googlechromelabs.github.io/chrome-for-testing/).
 
 ## Utilisation
 
@@ -55,7 +56,9 @@ Prérequis : Python 3.10+ et Chrome ou Chromium.
 python chrome_network_logger.py
 ```
 
-Au premier lancement, un profil isolé est créé dans `./capture_profile`. Les sessions et connexions de ton Chrome principal ne sont pas utilisées.
+Au premier lancement, un profil isolé et persistant est créé dans `./capture_profile`. Les sessions et connexions de ton Chrome principal ne sont pas utilisées. Si Chrome est absent, le binaire Stable officiel est téléchargé une seule fois dans le cache utilisateur (`%LOCALAPPDATA%\chrome-network-logger` sous Windows) puis réutilisé hors ligne. Aucun ChromeDriver, Selenium ou Playwright n’est installé.
+
+Il s’agit d’un vrai processus Chrome visible, lancé sans mode headless, sans WebDriver, sans `--enable-automation` et avec un port CDP loopback non nul pour que Chrome ne force pas `navigator.webdriver=true`. Cela évite les marqueurs propres à Selenium/Playwright, mais **ne garantit pas l’indétectabilité** : un site peut toujours inférer un profil neuf, une instrumentation CDP, des extensions, le réseau ou d’autres caractéristiques de l’environnement.
 
 Exemples :
 
@@ -96,6 +99,9 @@ Options importantes :
 | `--start-url URL` | Page initiale ; `about:blank` par défaut évite le trafic spontané du nouvel onglet |
 | `--proxy N\|random\|none` | Active explicitement un proxy ; `none`/connexion directe par défaut |
 | `--chrome-path PATH` | Chemin Chrome/Chromium explicite |
+| `--managed-chrome-dir PATH` | Emplacement du Chrome Stable officiel géré par l’outil |
+| `--no-download-chrome` | Refuse le téléchargement automatique si Chrome est absent |
+| `--refresh-managed-chrome` | Recherche une version Stable gérée plus récente lorsque le secours est utilisé |
 | `--version` | Affiche la version installée |
 
 ## Sortie
@@ -232,10 +238,11 @@ chrome_logger/
 ├── storage.py             # writer thread, JSONL, bodies et rapports
 ├── redaction.py           # masquage contextuel
 ├── proxy.py               # parsing et relay HTTP(S)
+├── managed_chrome.py      # téléchargement/cache officiel et extraction sûre
 └── chrome.py              # lancement/nettoyage du profil dédié
 ```
 
-`chrome_network_logger.py` reste un wrapper compatible. Les tests couvrent registres, frontières de sécurité CDP, cycles HTTP/Fetch/temps réel, timestamps, santé et limites du stockage, redaction, proxy, codes de sortie CLI et script d’interactions. Consulte [CONTRIBUTING.md](https://github.com/Antoninnnnnnnn/chrome-network-logger/blob/main/CONTRIBUTING.md) avant toute contribution.
+`chrome_network_logger.py` reste un wrapper compatible. Les tests couvrent registres, frontières de sécurité CDP, cycles HTTP/Fetch/temps réel, timestamps, santé et limites du stockage, redaction, proxy, installation gérée de Chrome, codes de sortie CLI et script d’interactions. Consulte [CONTRIBUTING.md](https://github.com/Antoninnnnnnnn/chrome-network-logger/blob/main/CONTRIBUTING.md) avant toute contribution.
 
 ## Sécurité et autorisation
 

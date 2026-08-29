@@ -27,7 +27,8 @@ Python toolkit for capturing **Chrome application-layer traffic** through the Ch
 - Rewritten proxy relay with correct socket lifecycle, IPv6, HTTP(S) upstream support, and live direct/proxy switching on Windows.
 - Fatal CDP/writer failures produce an error manifest and non-zero process exit code instead of a false success.
 - Bounded interaction payloads, pending `ExtraInfo`, proxy connections, and writer queue prevent unbounded memory growth.
-- Modular typed package, 83 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
+- Modular typed package, 96 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
+- Automatic official Stable Chrome for Testing download and caching when no local Chrome is available, without ChromeDriver.
 
 ## Installation
 
@@ -47,7 +48,7 @@ python -m build
 python -m twine check dist/*
 ```
 
-Requires Python 3.10+ and Chrome or Chromium.
+Requires Python 3.10+. An installed Chrome/Chromium is preferred; otherwise the [official Stable Chrome for Testing build](https://googlechromelabs.github.io/chrome-for-testing/) is fetched.
 
 ## Usage
 
@@ -55,7 +56,9 @@ Requires Python 3.10+ and Chrome or Chromium.
 python chrome_network_logger.py
 ```
 
-On first run, an isolated profile is created at `./capture_profile`. Your normal Chrome profile is not used.
+On first run, a persistent isolated profile is created at `./capture_profile`. Your normal Chrome profile is not used. If Chrome is missing, the official Stable browser is downloaded once into the user cache (`%LOCALAPPDATA%\chrome-network-logger` on Windows) and can then be reused offline. ChromeDriver, Selenium, and Playwright are not installed.
+
+This is a genuine visible Chrome process launched without headless mode, WebDriver, or `--enable-automation`, and with a non-zero loopback CDP port so Chrome does not force `navigator.webdriver=true`. That avoids Selenium/Playwright-specific markers, but it **does not guarantee invisibility**: a website may still infer a fresh profile, CDP instrumentation, extensions, network traits, or other environmental signals.
 
 Examples:
 
@@ -96,6 +99,9 @@ Important options:
 | `--start-url URL` | Initial page; defaults to `about:blank` to avoid unsolicited new-tab traffic |
 | `--proxy N\|random\|none` | Use an explicitly selected proxy; `none`/direct is the default |
 | `--chrome-path PATH` | Explicit Chrome/Chromium executable |
+| `--managed-chrome-dir PATH` | Cache location for the official managed Stable browser |
+| `--no-download-chrome` | Fail instead of downloading Chrome when no browser is installed |
+| `--refresh-managed-chrome` | Check for a newer managed Stable build when the fallback is used |
 | `--version` | Print the installed logger version |
 
 ## Output
@@ -189,10 +195,11 @@ chrome_logger/
 ├── storage.py             # writer thread, JSONL, bodies, and reports
 ├── redaction.py           # contextual redaction
 ├── proxy.py               # parsing and HTTP(S) relay
+├── managed_chrome.py      # official download/cache and safe extraction
 └── chrome.py              # dedicated-profile launch and cleanup
 ```
 
-`chrome_network_logger.py` remains a compatible wrapper. Tests cover registries, CDP handlers and security boundaries, HTTP/Fetch/realtime lifecycles, timestamps, storage health and limits, redaction, proxy behavior, CLI failure codes, and the injected interaction script. See [CONTRIBUTING.md](https://github.com/Antoninnnnnnnn/chrome-network-logger/blob/main/CONTRIBUTING.md) before submitting a change.
+`chrome_network_logger.py` remains a compatible wrapper. Tests cover registries, CDP handlers and security boundaries, HTTP/Fetch/realtime lifecycles, timestamps, storage health and limits, redaction, proxy behavior, managed Chrome installation, CLI failure codes, and the injected interaction script. See [CONTRIBUTING.md](https://github.com/Antoninnnnnnnn/chrome-network-logger/blob/main/CONTRIBUTING.md) before submitting a change.
 
 ## Security and authorization
 

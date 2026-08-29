@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from . import __version__
 from .cdp import CDPCapture
 from .chrome import (
+    choose_loopback_debugging_port,
     cleanup_profile_locks,
     find_chrome,
     kill_profile_chrome_processes,
@@ -21,6 +22,7 @@ from .chrome import (
     wait_for_cdp,
 )
 from .config import CaptureConfig
+from .managed_chrome import ManagedChrome, ManagedChromeError, ensure_managed_chrome
 from .proxy import build_proxy_route, load_proxies, select_proxy, start_toggle_keyboard
 from .redaction import Redactor
 from .storage import CaptureStore
@@ -77,6 +79,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", help="Parent directory for the timestamped session")
     parser.add_argument("--profile-dir", default="capture_profile", help="Dedicated Chrome profile directory")
     parser.add_argument("--chrome-path", help="Explicit Chrome/Chromium executable")
+    parser.add_argument(
+        "--managed-chrome-dir",
+        help="Cache directory for an official Chrome for Testing fallback",
+    )
+    parser.add_argument(
+        "--no-download-chrome",
+        action="store_true",
+        help="Fail instead of downloading official Chrome for Testing when Chrome is missing",
+    )
+    parser.add_argument(
+        "--refresh-managed-chrome",
+        action="store_true",
+        help="Check for a newer managed Stable build when the fallback is needed",
+    )
     parser.add_argument(
         "--start-url",
         type=_start_url,
@@ -158,9 +174,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     config.validate()
 
-    chrome_path = find_chrome(Path(args.chrome_path) if args.chrome_path else None)
     first_run = not (profile_dir / "Default").exists()
     profile_dir.mkdir(parents=True, exist_ok=True)
+    if args.no_download_chrome and args.refresh_managed_chrome:
+        parser.error("--refresh-managed-chrome cannot be combined with --no-download-chrome")
+    explicit_chrome = Path(args.chrome_path) if args.chrome_path else None
+    managed_browser: ManagedChrome | None = None
+    try:
+        chrome_path = find_chrome(explicit_chrome)
+    except FileNotFoundError as exc:
+        if explicit_chrome is not None or args.no_download_chrome:
+            parser.error(str(exc))
+        managed_dir = Path(args.managed_chrome_dir) if args.managed_chrome_dir else None
+        try:
+            managed_browser = ensure_managed_chrome(
+                managed_dir,
+                refresh=args.refresh_managed_chrome,
+                progress=lambda message: LOG.info("%s", message),
+            )
+        except (ManagedChromeError, OSError) as install_error:
+            parser.error(f"Chrome is missing and the managed fallback failed: {install_error}")
+        chrome_path = managed_browser.executable
+        LOG.info("Using official managed Chrome %s from %s", managed_browser.version, chrome_path)
     killed = kill_profile_chrome_processes(profile_dir)
     if killed:
         LOG.info("Stopped %s orphan Chrome process(es) using the dedicated profile", killed)
@@ -189,6 +224,18 @@ def main(argv: list[str] | None = None) -> int:
 
     redactor = Redactor(config.sensitive_mode)
     store = CaptureStore(config, redactor)
+    if managed_browser:
+        store.set_manifest(
+            browserInstall={
+                "source": "chromeForTestingStable",
+                "version": managed_browser.version,
+                "platform": managed_browser.platform,
+                "archiveSha256": managed_browser.archive_sha256,
+                "executableSha256": managed_browser.executable_sha256,
+            }
+        )
+    else:
+        store.set_manifest(browserInstall={"source": "explicit" if explicit_chrome else "system"})
 
     def safe_warning(message: str) -> None:
         try:
@@ -229,8 +276,9 @@ def main(argv: list[str] | None = None) -> int:
                 LOG.debug("Signal handlers can only be installed from the main thread")
 
     try:
-        # Chrome chooses the port atomically and writes it to DevToolsActivePort.
-        port = 0
+        # Port 0 makes Chrome expose navigator.webdriver=true. Resolve a
+        # non-zero loopback port immediately before launch instead.
+        port = choose_loopback_debugging_port()
         chrome = launch_chrome(chrome_path, profile_dir, port, [*proxy_args, args.start_url])
         version = wait_for_cdp(chrome)
         port = chrome.port

@@ -3,6 +3,7 @@ session_*/
 capture_profile/
 captures/
 profiles/
+.managed-chrome/
 
 # Proxy credentials
 proxy.txt

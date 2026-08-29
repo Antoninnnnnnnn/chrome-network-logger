@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import socket
 from pathlib import Path
 
 import pytest
 
 from chrome_logger import chrome as chrome_module
-from chrome_logger.chrome import ChromeProcess, fetch_json, wait_for_cdp
+from chrome_logger.chrome import ChromeProcess, choose_loopback_debugging_port, fetch_json, wait_for_cdp
 
 
 class ExitedProcess:
@@ -50,3 +51,10 @@ def test_fetch_json_rejects_non_local_paths_and_invalid_ports() -> None:
     for port, path in ((0, "/json"), (65536, "/json"), (9222, "http://example.test"), (9222, "//host/json")):
         with pytest.raises(ValueError):
             fetch_json(port, path)
+
+
+def test_debugging_port_is_nonzero_and_released_for_chrome() -> None:
+    port = choose_loopback_debugging_port()
+    assert 1 <= port <= 65535
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", port))

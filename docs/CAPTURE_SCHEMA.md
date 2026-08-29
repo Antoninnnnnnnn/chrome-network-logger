@@ -13,7 +13,8 @@ Every session is created under a unique `session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM`
 - logger version, start/end timestamps, and `running`, `complete`, `partial`, or `error` status;
 - effective capture configuration and proxy route state;
 - warnings, capture statistics, writer health, and body-storage totals;
-- Chrome and protocol versions after a successful CDP connection.
+- Chrome and protocol versions after a successful CDP connection;
+- `browserInstall`, identifying a system/explicit browser or the managed Stable version, platform, and locally computed archive/executable SHA-256 values.
 
 An `error` status or non-zero process exit means the capture must not be treated as complete. A `partial` status indicates an unexpected browser/CDP close or incomplete flushed requests.
 

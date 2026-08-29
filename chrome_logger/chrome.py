@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -136,6 +137,21 @@ def cleanup_profile_locks(profile_dir: Path) -> None:
                 (directory / name).unlink(missing_ok=True)
             except OSError:
                 LOG.debug("Could not remove profile lock %s", directory / name)
+
+
+def choose_loopback_debugging_port() -> int:
+    """Ask the OS for a free non-zero loopback port.
+
+    Chrome exposes ``navigator.webdriver`` when remote debugging uses port 0,
+    so the launcher resolves an ephemeral port immediately before startup.
+    The CDP endpoint is still validated as loopback-only after Chrome binds it.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = int(reservation.getsockname()[1])
+    if not 1 <= port <= 65535:
+        raise RuntimeError(f"Operating system returned an invalid debugging port: {port}")
+    return port
 
 
 def launch_chrome(
