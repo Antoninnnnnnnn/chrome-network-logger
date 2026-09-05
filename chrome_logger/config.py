@@ -23,7 +23,9 @@ class CaptureConfig:
     body_mode: BodyMode = "api"
     # Bodies taken during Fetch interception survive targets that die mid-request.
     intercept_bodies: InterceptMode = "api"
-    sensitive_mode: SensitiveMode = "safe"
+    # Raw by default: captures are meant to be usable for debugging the
+    # application that produced them. Redaction is opt-in with safe mode.
+    sensitive_mode: SensitiveMode = "raw"
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     max_session_body_bytes: int = DEFAULT_MAX_SESSION_BODY_BYTES
     max_total_buffer: int = DEFAULT_MAX_TOTAL_BUFFER

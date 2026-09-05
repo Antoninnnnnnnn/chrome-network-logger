@@ -24,7 +24,7 @@ Outil Python pour capturer le **trafic applicatif visible par Chrome** avec le C
 - Cookies et Web Storage capturés par événements, pas par échantillons : chaque mutation `DOMStorage`, un diff du jar après chaque événement qui peut le changer, et un dump complet de la page sur `pagehide`/`freeze`/`visibilitychange` pour que fermer le navigateur conserve l'état final.
 - Console, exceptions, logs navigateur et navigations enregistrés dans des fichiers dédiés.
 - Script d’interactions installé dans un monde JavaScript isolé ; en mode sûr, toutes les valeurs de formulaire sont masquées et aucun `outerHTML` brut n’est exporté.
-- Secrets masqués par défaut avec une longueur et un HMAC propre à la session, sans perdre l'information qu'une valeur existait.
+- Captures brutes par défaut pour rester exploitables ; `--sensitive safe` masque les secrets en conservant leur longueur et un HMAC propre à la session.
 - Relay proxy réécrit : sockets correctement suivis/fermés, IPv6, proxy HTTP ou HTTPS, bascule directe en live sous Windows.
 - Les erreurs fatales CDP/writer produisent un manifeste `error` et un code de sortie non nul, sans faux succès.
 - Payloads d’interaction, `ExtraInfo` en attente, connexions proxy et file du writer sont bornés.
@@ -64,8 +64,8 @@ Il s’agit d’un vrai processus Chrome visible, lancé sans mode headless, san
 Exemples :
 
 ```bash
-# Bodies des XHR/Fetch/Documents, secrets masqués — valeurs par défaut
-python chrome_network_logger.py --body-mode api --sensitive safe
+# Bodies des XHR/Fetch/Documents, valeurs conservées telles quelles — valeurs par défaut
+python chrome_network_logger.py --body-mode api --sensitive raw
 
 # Capture réseau plus large
 python chrome_network_logger.py --body-mode all
@@ -73,8 +73,8 @@ python chrome_network_logger.py --body-mode all
 # Aucun body, seulement métadonnées/headers/timings
 python chrome_network_logger.py --body-mode none
 
-# Valeurs brutes : mots de passe, cookies et tokens seront enregistrés
-python chrome_network_logger.py --sensitive raw
+# Masquer mots de passe, cookies et tokens
+python chrome_network_logger.py --sensitive safe
 
 # Dossier et profil explicites
 python chrome_network_logger.py --output-dir captures/shein --profile-dir profiles/shein
@@ -90,7 +90,7 @@ Options importantes :
 | `--body-mode none\|api\|all` | Politique des bodies HTTP et des payloads WebSocket/SSE |
 | `--max-body-mb 32` | Taille stockée maximale par body ; `0` = illimité |
 | `--max-session-body-mb 2048` | Total maximal de bodies uniques stockés par session ; `0` = illimité |
-| `--sensitive safe\|raw` | Masquage par défaut ou conservation brute |
+| `--sensitive raw\|safe` | `raw` (défaut) conserve les valeurs telles quelles ; `safe` les masque |
 | `--no-interactions` | Désactive clics, inputs, formulaires et navigation SPA injectée |
 | `--capture-clipboard` | Capture les collages ; masqués en mode `safe` |
 | `--no-console` | Désactive console, exceptions et domaine `Log` |

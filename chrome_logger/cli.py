@@ -120,7 +120,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum stored body bytes for the whole session; 0 means unlimited",
     )
     parser.add_argument(
-        "--sensitive", choices=("safe", "raw"), default="safe", help="Redact secrets or preserve raw values"
+        "--sensitive",
+        choices=("safe", "raw"),
+        default="raw",
+        help="raw keeps credentials, cookies and tokens as captured; safe redacts them",
     )
     parser.add_argument("--no-interactions", action="store_true", help="Disable click/input/form timeline capture")
     parser.add_argument(
@@ -347,7 +350,8 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     started_at = time.monotonic()
     if config.sensitive_mode == "raw":
-        print("WARNING: raw mode stores credentials, cookies and tokens without redaction.")
+        print("WARNING: raw mode is active: this session will store credentials, cookies and tokens in clear text.")
+        print("         Anyone who reads the session directory gets them. Use --sensitive safe to redact.")
 
     def request_stop(signum=None, _frame=None) -> None:
         nonlocal shutdown_reason

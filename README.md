@@ -24,7 +24,7 @@ Python toolkit for capturing **Chrome application-layer traffic** through the Ch
 - Cookies and Web Storage captured from events, not samples: every `DOMStorage` mutation, a cookie-jar diff after each event that can change it, and a full page dump on `pagehide`/`freeze`/`visibilitychange` so closing the browser keeps the final state.
 - Dedicated browser console, exception, log, navigation, and target files.
 - A single interaction script installed in an isolated JavaScript world; safe mode redacts every form-control value and never exports raw `outerHTML`.
-- Sensitive values are redacted by default while retaining their length and a per-session HMAC.
+- Captures are raw by default so bodies, cookies and tokens stay usable; `--sensitive safe` redacts them while retaining their length and a per-session HMAC.
 - Rewritten proxy relay with correct socket lifecycle, IPv6, HTTP(S) upstream support, and live direct/proxy switching on Windows.
 - Fatal CDP/writer failures produce an error manifest and non-zero process exit code instead of a false success.
 - Bounded interaction payloads, pending `ExtraInfo`, proxy connections, and writer queue prevent unbounded memory growth.
@@ -64,8 +64,8 @@ This is a genuine visible Chrome process launched without headless mode, WebDriv
 Examples:
 
 ```bash
-# XHR/Fetch/Document bodies, secrets redacted — defaults
-python chrome_network_logger.py --body-mode api --sensitive safe
+# XHR/Fetch/Document bodies, values kept as captured — defaults
+python chrome_network_logger.py --body-mode api --sensitive raw
 
 # Wider body capture
 python chrome_network_logger.py --body-mode all
@@ -73,8 +73,8 @@ python chrome_network_logger.py --body-mode all
 # Metadata, headers and timings only
 python chrome_network_logger.py --body-mode none
 
-# Raw credentials, cookies and tokens are preserved
-python chrome_network_logger.py --sensitive raw
+# Redact credentials, cookies and tokens
+python chrome_network_logger.py --sensitive safe
 
 # Explicit output/profile locations
 python chrome_network_logger.py --output-dir captures/example --profile-dir profiles/example
@@ -90,7 +90,7 @@ Important options:
 | `--body-mode none\|api\|all` | HTTP body and WebSocket/SSE payload policy |
 | `--max-body-mb 32` | Maximum stored bytes per body; `0` means unlimited |
 | `--max-session-body-mb 2048` | Maximum total unique stored body bytes per session; `0` means unlimited |
-| `--sensitive safe\|raw` | Default redaction or raw preservation |
+| `--sensitive raw\|safe` | `raw` (default) keeps values as captured; `safe` redacts them |
 | `--no-interactions` | Disable injected clicks, inputs, forms, and SPA navigation events |
 | `--capture-clipboard` | Capture pasted text; redacted in safe mode |
 | `--no-console` | Disable console, exceptions, and Log-domain files |
@@ -140,7 +140,7 @@ See [the capture schema](https://github.com/Antoninnnnnnnn/chrome-network-logger
 
 ## Sensitive-data handling
 
-The default `--sensitive safe` mode redacts authorization and cookie headers, passwords, secrets, API keys, access/refresh/ID tokens, OTP/PIN/CVV-like values, sensitive URL parameters (including `data:`/`javascript:` URLs), structured JSON/form fields, every form-control value, form data, sensitive HTML attributes, storage values, and clipboard payloads.
+The opt-in `--sensitive safe` mode redacts authorization and cookie headers, passwords, secrets, API keys, access/refresh/ID tokens, OTP/PIN/CVV-like values, sensitive URL parameters (including `data:`/`javascript:` URLs), structured JSON/form fields, every form-control value, form data, sensitive HTML attributes, storage values, and clipboard payloads.
 
 A redacted value looks like:
 
@@ -148,7 +148,7 @@ A redacted value looks like:
 <redacted len=123 hmac=4ab31c8702ef>
 ```
 
-The HMAC uses a random key created for each capture: equal values can be compared **within one session**, but not across sessions. The key is not written to the logs. Input and form values are redacted inside the isolated page world as `<redacted len=N source=browser>`: the raw value never crosses the CDP binding, and this length-only marker is not an equality fingerprint. Safe-mode element markup is replaced by a tag-only placeholder. Raw mode must be selected explicitly.
+The HMAC uses a random key created for each capture: equal values can be compared **within one session**, but not across sessions. The key is not written to the logs. Input and form values are redacted inside the isolated page world as `<redacted len=N source=browser>`: the raw value never crosses the CDP binding, and this length-only marker is not an equality fingerprint. Safe-mode element markup is replaced by a tag-only placeholder. Raw mode is the default: a session directory then contains usable credentials and must be treated as a secret.
 
 Safe mode is a protective default, not a guarantee that every possible secret will be recognized. A proprietary format, binary payload, encrypted application payload, or sensitive field with an unusual name may remain visible, so every capture should still be treated as confidential. See the [threat model](https://github.com/Antoninnnnnnnn/chrome-network-logger/blob/main/docs/THREAT_MODEL.md).
 

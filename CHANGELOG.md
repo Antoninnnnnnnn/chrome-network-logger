@@ -9,6 +9,12 @@ All notable changes to Chrome Network Logger are documented here.
 - Stop configuring CDP durable messages. On Chrome 152 that call makes the network service drop retained response bodies, so every `Network.getResponseBody` returned `No data found for resource with given identifier` and no body was captured. A local reproduction went from 0/30 to 30/30 bodies once the call was removed.
 - Add `--durable-messages` for anyone who wants the old behaviour, documented as breaking body retrieval.
 
+### Raw capture by default
+
+- `--sensitive` now defaults to `raw`: bodies, cookies, tokens and form values are stored as captured, so a session is directly usable for debugging the application that produced it. Redaction becomes opt-in with `--sensitive safe`.
+- Warn on every raw session that the directory holds credentials in clear text and name the flag that redacts them.
+- `.gitignore` already excludes `session_*/`, `captures/`, `profiles/`, and `capture_profile/` at any depth, so captures stay out of commits. Files copied out of a session directory are not covered.
+
 ### Clean stop
 
 - Print a plain end-of-session summary that says why the capture stopped, that the data was written, how many requests and bodies were kept, and where to start reading. `partial` no longer looks like data loss.
