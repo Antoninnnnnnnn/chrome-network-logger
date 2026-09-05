@@ -47,6 +47,7 @@ If the session body limit is reached, the record instead has `omitted: true`, `o
 - `interactions/`: user and form events from the isolated interaction world.
 - `browser/`: targets, navigation, console, exceptions, logs, protocol diagnostics, and proxy toggles.
 - `snapshots/`: start/end/attach cookie and Web Storage dumps, plus `cookies_final.json` and `dom_storage_final.json` rebuilt from the event stream.
+- `storage/indexeddb.jsonl` and `storage/cache_storage.jsonl`: IndexedDB database lists, object-store schemas and bounded record dumps, plus Cache Storage cache lists and entry metadata, each line naming the `reason` that triggered the dump.
 - `storage/`: every state mutation as it happened — `cookie_changes.jsonl` (added/updated/removed cookies with the event that triggered the read), `dom_storage_events.jsonl` (localStorage/sessionStorage changes), and `page_flushes.jsonl` (full dumps sent by the injected script when a page is hidden, frozen, or unloaded).
 - `reports/`: derived human-readable text, CSV, and escaped HTML; these are not canonical inputs.
 

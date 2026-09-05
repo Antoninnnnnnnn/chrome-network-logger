@@ -483,7 +483,13 @@ class CaptureStore:
                     )
             report.write("</body></html>\n")
 
-    def close(self, *, status: str = "complete", stats: dict[str, Any] | None = None) -> None:
+    def close(
+        self,
+        *,
+        status: str = "complete",
+        stats: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> None:
         if self._closed:
             return
         failure: BaseException | None = None
@@ -499,6 +505,7 @@ class CaptureStore:
                 with self._manifest_lock:
                     self._manifest["endedAt"] = _now_iso()
                     self._manifest["status"] = status
+                    self._manifest["shutdownReason"] = reason
                     if stats is not None:
                         self._manifest["stats"] = stats
                     self._manifest["writer"] = {

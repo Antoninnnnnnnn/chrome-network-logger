@@ -9,6 +9,20 @@ All notable changes to Chrome Network Logger are documented here.
 - Stop configuring CDP durable messages. On Chrome 152 that call makes the network service drop retained response bodies, so every `Network.getResponseBody` returned `No data found for resource with given identifier` and no body was captured. A local reproduction went from 0/30 to 30/30 bodies once the call was removed.
 - Add `--durable-messages` for anyone who wants the old behaviour, documented as breaking body retrieval.
 
+### IndexedDB and Cache Storage capture
+
+- Capture IndexedDB and Cache Storage, which never appear in network traffic and vanish with the browser. Chrome's `Storage` events say which database, object store, or cache changed, and only that scope is re-dumped.
+- Store IndexedDB database lists, object-store schemas, and records in `storage/indexeddb.jsonl`; store cache lists and entry metadata in `storage/cache_storage.jsonl`.
+- Read object-store records from the page instead of `IndexedDB.requestData`, which only answers with `RemoteObject` references and never inlines the values.
+- Bound every dump with `--max-idb-entries` (500) and `--max-cache-entries` (200), and add `--no-client-storage` to switch the whole feature off.
+
+### Bodies for targets that die mid-request
+
+- Take response bodies during Fetch interception for XHR and Fetch, not just documents (`--intercept-bodies none|document|api|all`, default `api`). A body taken while the response is paused no longer depends on the target still being attached when the body is requested.
+- Never pause for the body of a streamed response (`text/event-stream`, `multipart/x-mixed-replace`, `application/grpc`, `application/x-ndjson`) or one whose `Content-Length` exceeds the per-body limit; those continue immediately and fall back to `Network.getResponseBody`.
+- Record how the session ended in `manifest.json` as `shutdownReason`, instead of leaving only `status`.
+- Note: a request cancelled because its iframe or worker was destroyed has no response at all, so no body can be recovered for it. Those stay `incomplete`.
+
 ### Event-sourced cookie and Web Storage capture
 
 - Record every `localStorage`/`sessionStorage` mutation from `DOMStorage` events into `storage/dom_storage_events.jsonl`, using the attach-time page dump as the baseline they apply to.

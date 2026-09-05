@@ -20,6 +20,7 @@ Outil Python pour capturer le **trafic applicatif visible par Chrome** avec le C
 - WebSocket et SSE écrits au fil de l'eau, sans accumulation illimitée en mémoire.
 - Une seule source canonique : `network/requests.jsonl`.
 - Timestamps normalisés (`epochMs`, ISO local et horloge monotone CDP quand disponible).
+- IndexedDB et Cache Storage capturés via les événements `Storage`, avec des dumps bornés lus depuis la page pour obtenir les vraies valeurs et non des références `RemoteObject`.
 - Cookies et Web Storage capturés par événements, pas par échantillons : chaque mutation `DOMStorage`, un diff du jar après chaque événement qui peut le changer, et un dump complet de la page sur `pagehide`/`freeze`/`visibilitychange` pour que fermer le navigateur conserve l'état final.
 - Console, exceptions, logs navigateur et navigations enregistrés dans des fichiers dédiés.
 - Script d’interactions installé dans un monde JavaScript isolé ; en mode sûr, toutes les valeurs de formulaire sont masquées et aucun `outerHTML` brut n’est exporté.
@@ -27,7 +28,7 @@ Outil Python pour capturer le **trafic applicatif visible par Chrome** avec le C
 - Relay proxy réécrit : sockets correctement suivis/fermés, IPv6, proxy HTTP ou HTTPS, bascule directe en live sous Windows.
 - Les erreurs fatales CDP/writer produisent un manifeste `error` et un code de sortie non nul, sans faux succès.
 - Payloads d’interaction, `ExtraInfo` en attente, connexions proxy et file du writer sont bornés.
-- Package typé, 115 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
+- Package typé, 133 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
 - Si aucun Chrome local n’existe, téléchargement et mise en cache automatiques du Chrome for Testing Stable officiel, sans ChromeDriver.
 
 ## Installation
@@ -94,6 +95,10 @@ Options importantes :
 | `--capture-clipboard` | Capture les collages ; masqués en mode `safe` |
 | `--no-console` | Désactive console, exceptions et domaine `Log` |
 | `--no-storage` | Désactive snapshots cookies/localStorage/sessionStorage |
+| `--no-client-storage` | Désactive la capture IndexedDB et Cache Storage |
+| `--max-idb-entries 500` | Nombre maximal d'enregistrements IndexedDB par object store et par dump |
+| `--max-cache-entries 200` | Nombre maximal d'entrées Cache Storage par cache et par dump |
+| `--intercept-bodies api` | Types dont le corps est pris pendant la pause de la réponse, ce qui conserve les corps des cibles fermées en cours de requête |
 | `--durable-messages` | Active les messages durables CDP ; le Chrome actuel refuse alors de renvoyer les corps de réponse |
 | `--snapshot-interval 0` | Snapshot cookies/storage périodique supplémentaire toutes les N secondes ; `0` s'appuie uniquement sur la capture par événements |
 | `--keep-chrome` | Laisse Chrome ouvert après avoir désactivé Fetch, l'auto-attach et les listeners injectés |
@@ -138,6 +143,8 @@ session_YYYYMMDD_HHMMSS_mmm_PID_ALÉA/
 │   └── proxy_toggles.jsonl
 ├── storage/
 │   ├── cookie_changes.jsonl
+│   ├── indexeddb.jsonl
+│   ├── cache_storage.jsonl
 │   ├── dom_storage_events.jsonl
 │   └── page_flushes.jsonl
 ├── snapshots/

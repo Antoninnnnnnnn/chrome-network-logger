@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 BodyMode = Literal["none", "api", "all"]
+InterceptMode = Literal["none", "document", "api", "all"]
 SensitiveMode = Literal["safe", "raw"]
 
 DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
@@ -20,6 +21,8 @@ class CaptureConfig:
     output_parent: Path
     profile_dir: Path
     body_mode: BodyMode = "api"
+    # Bodies taken during Fetch interception survive targets that die mid-request.
+    intercept_bodies: InterceptMode = "api"
     sensitive_mode: SensitiveMode = "safe"
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     max_session_body_bytes: int = DEFAULT_MAX_SESSION_BODY_BYTES
@@ -30,6 +33,11 @@ class CaptureConfig:
     capture_clipboard: bool = False
     capture_console: bool = True
     capture_storage: bool = True
+    # IndexedDB and Cache Storage exist only inside the browser and never
+    # appear in network traffic, so they are captured from Storage events.
+    capture_client_storage: bool = True
+    max_idb_entries: int = 500
+    max_cache_entries: int = 200
     compress_text_bodies: bool = True
     body_inline_limit: int = 4 * 1024
     websocket_inline_limit: int = 64 * 1024
@@ -49,6 +57,8 @@ class CaptureConfig:
     def validate(self) -> None:
         if self.body_mode not in {"none", "api", "all"}:
             raise ValueError(f"Invalid body mode: {self.body_mode}")
+        if self.intercept_bodies not in {"none", "document", "api", "all"}:
+            raise ValueError(f"Invalid interception mode: {self.intercept_bodies}")
         if self.sensitive_mode not in {"safe", "raw"}:
             raise ValueError(f"Invalid sensitive mode: {self.sensitive_mode}")
         if self.max_body_bytes < 0:
@@ -61,6 +71,9 @@ class CaptureConfig:
             raise ValueError("max_resource_buffer cannot exceed max_total_buffer")
         if self.writer_queue_size < 100:
             raise ValueError("writer_queue_size is too small")
+        for name in ("max_idb_entries", "max_cache_entries"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be >= 1")
         if self.max_interaction_payload_bytes < 1024:
             raise ValueError("max_interaction_payload_bytes is too small")
         if self.max_storage_payload_bytes < self.max_interaction_payload_bytes:

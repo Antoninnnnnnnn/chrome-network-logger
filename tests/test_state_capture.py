@@ -289,3 +289,24 @@ def test_durable_messages_can_be_opted_into(tmp_path: Path) -> None:
     capture._enable_session("s", {"targetId": "t", "type": "page"})
     configure = next(m for m in socket.sent if m["method"] == "Network.configureDurableMessages")
     assert configure["params"]["maxTotalBufferSize"] == capture.config.max_total_buffer
+
+
+def test_interception_patterns_follow_the_configured_scope(tmp_path: Path) -> None:
+    capture, _, _ = make_capture(tmp_path)
+    capture.config.intercept_bodies = "document"
+    assert [p.get("resourceType") for p in capture._interception_patterns()] == ["Document"]
+    capture.config.intercept_bodies = "api"
+    assert [p.get("resourceType") for p in capture._interception_patterns()] == ["Document", "XHR", "Fetch"]
+    capture.config.intercept_bodies = "all"
+    assert capture._interception_patterns() == [{"urlPattern": "*", "requestStage": "Response"}]
+
+
+def test_streaming_and_oversized_responses_are_not_paused_for_their_body(tmp_path: Path) -> None:
+    capture, _, _ = make_capture(tmp_path)
+    assert capture._body_must_stream("text/event-stream", {})
+    assert capture._body_must_stream("application/x-ndjson; charset=utf-8", {})
+    assert not capture._body_must_stream("application/json", {"content-length": "2048"})
+    limit = capture.config.max_body_bytes
+    assert capture._body_must_stream("application/json", {"content-length": str(limit + 1)})
+    capture.config.max_body_bytes = 0
+    assert not capture._body_must_stream("application/json", {"content-length": str(limit + 1)})

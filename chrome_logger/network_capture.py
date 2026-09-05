@@ -4,7 +4,7 @@ import copy
 import time
 from typing import Any
 
-from .constants import API_TYPES, REDIRECT_CODES, WRITE_METHODS
+from .constants import API_TYPES, REDIRECT_CODES, STREAMING_CONTENT_TYPES, WRITE_METHODS
 from .models import PendingCommand
 
 
@@ -222,18 +222,23 @@ class NetworkCaptureMixin:
         if params.get("responseErrorReason") or status in REDIRECT_CODES or status in {204, 205, 304} or not network_id:
             self.send("Fetch.continueResponse", {"requestId": fetch_id}, session_id)
             return
+        headers = params.get("responseHeaders") or []
+        header_value = {str(item.get("name", "")).lower(): str(item.get("value", "")) for item in headers}
+        content_type = header_value.get("content-type")
         with self.state_lock:
             key, entry = self.registry.current(session_id, str(network_id))
             if not key or not entry:
                 self.send("Fetch.continueResponse", {"requestId": fetch_id}, session_id)
                 return
+            if not self._should_capture_body(entry) or self._body_must_stream(content_type, header_value):
+                # Taking the body here would buffer the whole response inside
+                # Chrome, which stalls streamed responses and large downloads.
+                # Let it flow and rely on Network.getResponseBody instead.
+                self.stats["interceptionBypassed"] += 1
+                self.send("Fetch.continueResponse", {"requestId": fetch_id}, session_id)
+                return
             entry["_pendingFetchBody"] = True
             self.paused_fetches[fetch_id] = (session_id, key)
-            headers = params.get("responseHeaders") or []
-            content_type = next(
-                (str(item.get("value")) for item in headers if str(item.get("name", "")).lower() == "content-type"),
-                None,
-            )
             self.send(
                 "Fetch.getResponseBody",
                 {"requestId": fetch_id},
@@ -249,6 +254,17 @@ class NetworkCaptureMixin:
                     time.monotonic(),
                 ),
             )
+
+    def _body_must_stream(self, content_type: str | None, headers: dict[str, str]) -> bool:
+        """Report whether pausing for the body would break or bloat the response."""
+        normalized = (content_type or "").lower()
+        if any(marker in normalized for marker in STREAMING_CONTENT_TYPES):
+            return True
+        length = headers.get("content-length")
+        limit = self.config.max_body_bytes
+        if limit and length and length.isdigit() and int(length) > limit:
+            return True
+        return False
 
     def _content_type(self, entry: dict[str, Any], request: bool = False) -> str | None:
         container = entry.get("request") if request else entry.get("response")

@@ -20,6 +20,7 @@ Python toolkit for capturing **Chrome application-layer traffic** through the Ch
 - WebSocket frames and SSE messages are streamed to disk rather than accumulated indefinitely in RAM.
 - One canonical source: `network/requests.jsonl`.
 - Normalized timestamps (`epochMs`, local ISO time, and CDP monotonic time when available).
+- IndexedDB and Cache Storage captured from `Storage` events, with bounded record dumps read from the page so values are real data instead of `RemoteObject` references.
 - Cookies and Web Storage captured from events, not samples: every `DOMStorage` mutation, a cookie-jar diff after each event that can change it, and a full page dump on `pagehide`/`freeze`/`visibilitychange` so closing the browser keeps the final state.
 - Dedicated browser console, exception, log, navigation, and target files.
 - A single interaction script installed in an isolated JavaScript world; safe mode redacts every form-control value and never exports raw `outerHTML`.
@@ -27,7 +28,7 @@ Python toolkit for capturing **Chrome application-layer traffic** through the Ch
 - Rewritten proxy relay with correct socket lifecycle, IPv6, HTTP(S) upstream support, and live direct/proxy switching on Windows.
 - Fatal CDP/writer failures produce an error manifest and non-zero process exit code instead of a false success.
 - Bounded interaction payloads, pending `ExtraInfo`, proxy connections, and writer queue prevent unbounded memory growth.
-- Modular typed package, 115 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
+- Modular typed package, 133 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
 - Automatic official Stable Chrome for Testing download and caching when no local Chrome is available, without ChromeDriver.
 
 ## Installation
@@ -94,6 +95,10 @@ Important options:
 | `--capture-clipboard` | Capture pasted text; redacted in safe mode |
 | `--no-console` | Disable console, exceptions, and Log-domain files |
 | `--no-storage` | Disable cookie and Web Storage snapshots |
+| `--no-client-storage` | Disable IndexedDB and Cache Storage capture |
+| `--max-idb-entries 500` | Maximum IndexedDB records dumped per object store, per dump |
+| `--max-cache-entries 200` | Maximum Cache Storage entries dumped per cache, per dump |
+| `--intercept-bodies api` | Resource types whose body is taken while the response is paused, which keeps bodies for targets that close mid-request |
 | `--durable-messages` | Configure CDP durable messages; current Chrome then refuses to return response bodies |
 | `--snapshot-interval 0` | Extra periodic cookie/storage snapshot every N seconds; `0` relies on event capture alone |
 | `--keep-chrome` | Leave Chrome open after disabling Fetch, auto-attach, and injected listeners |
@@ -118,7 +123,7 @@ session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM/
 ├── realtime/
 ├── interactions/
 ├── browser/                 # includes protocol_capabilities.jsonl
-├── storage/                 # cookie_changes, dom_storage_events, page_flushes
+├── storage/                 # cookie_changes, dom_storage_events, page_flushes, indexeddb, cache_storage
 ├── snapshots/               # start/end/attach dumps and rebuilt final state
 └── reports/
     ├── summary.txt
@@ -195,6 +200,7 @@ chrome_logger/
 ├── realtime_capture.py    # WebSocket, SSE, and WebTransport
 ├── browser_capture.py     # interactions, console, navigation, snapshots
 ├── state_capture.py       # event-sourced cookies and Web Storage
+├── client_storage.py      # IndexedDB and Cache Storage dumps
 ├── registry.py            # session/request/hop identity and ExtraInfo ordering
 ├── storage.py             # writer thread, JSONL, bodies, and reports
 ├── redaction.py           # contextual redaction

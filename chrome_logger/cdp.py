@@ -13,6 +13,7 @@ import websocket
 
 from .browser_capture import BrowserCaptureMixin
 from .chrome import fetch_json
+from .client_storage import ClientStorageMixin
 from .config import CaptureConfig
 from .constants import PAGE_TYPES, SESSION_GONE_CODES, SESSION_GONE_MARKERS, TARGET_TYPES
 from .models import PendingCommand
@@ -26,7 +27,13 @@ from .timestamps import TimestampMapper
 LOG = logging.getLogger(__name__)
 
 
-class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin, StateCaptureMixin):
+class CDPCapture(
+    NetworkCaptureMixin,
+    RealtimeCaptureMixin,
+    BrowserCaptureMixin,
+    StateCaptureMixin,
+    ClientStorageMixin,
+):
     def __init__(self, port: int, config: CaptureConfig, store: CaptureStore):
         self.port = port
         self.config = config
@@ -72,6 +79,10 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
         self._cookie_sync_earliest = 0.0
         self._cookie_baseline_written = False
         self._dom_storage: dict[str, dict[str, Any]] = {}
+        # IndexedDB and Cache Storage dumps, keyed by the scope that changed.
+        self._client_storage_origins: set[str] = set()
+        self._client_storage_requests: dict[tuple[str, str, str | None, str | None, str | None], str] = {}
+        self._client_storage_earliest = 0.0
         self.stats = {
             "requests": 0,
             "responses": 0,
@@ -94,6 +105,11 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
             "storageChanges": 0,
             "storageFlushes": 0,
             "droppedStorageFlushes": 0,
+            "interceptionBypassed": 0,
+            "idbEntries": 0,
+            "cacheEntries": 0,
+            "clientStorageErrors": 0,
+            "clientStorageSkipped": 0,
         }
 
     def _fail_capture(self, message: str, error: BaseException | None = None) -> None:
@@ -305,6 +321,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
             self._handle_snapshot_response(kind, data, error, {})
         elif kind == "cookie_sync":
             self._handle_cookie_sync(data, error, {})
+        elif kind in {"idb_names", "idb_database", "idb_data", "cache_names", "cache_entries"}:
+            self._handle_client_storage_response(kind, data, error, {})
         elif kind == "interaction_script":
             self.store.write_jsonl(
                 "browser/protocol_errors.jsonl",
@@ -375,6 +393,24 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
             {"targetId": target_id, "flatten": True},
             pending=PendingCommand("attach_target", {"targetId": target_id}, time.monotonic()),
         )
+
+    def _interception_patterns(self) -> list[dict[str, Any]]:
+        """Response-stage patterns for Fetch interception.
+
+        A body taken while the response is paused is captured before the target
+        can die, which is the only way to keep bodies for short-lived iframes,
+        blob workers, and pages that close mid-request. `Network.getResponseBody`
+        needs the target to still be attached when the body is requested.
+        """
+        if self.config.intercept_bodies == "all":
+            return [{"urlPattern": "*", "requestStage": "Response"}]
+        resource_types = ["Document"]
+        if self.config.intercept_bodies == "api":
+            resource_types = ["Document", "XHR", "Fetch"]
+        return [
+            {"urlPattern": "*", "requestStage": "Response", "resourceType": resource_type}
+            for resource_type in resource_types
+        ]
 
     def _enable_session(self, session_id: str, target_info: dict[str, Any]) -> None:
         target_id = str(target_info.get("targetId") or "")
@@ -464,6 +500,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
             )
             self.snapshot("attach", sessions=[session_id], include_cookies=False)
             self.request_cookie_sync("targetAttached")
+            if self.config.capture_client_storage:
+                self.track_client_storage(session_id, target_info)
         if target_info.get("type") in PAGE_TYPES:
             self.send(
                 "Page.enable",
@@ -474,17 +512,11 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
                     time.monotonic(),
                 ),
             )
-            if self.config.body_mode != "none":
+            if self.config.body_mode != "none" and self.config.intercept_bodies != "none":
                 self.send(
                     "Fetch.enable",
                     {
-                        "patterns": [
-                            {
-                                "urlPattern": "*",
-                                "requestStage": "Response",
-                                "resourceType": "Document",
-                            }
-                        ],
+                        "patterns": self._interception_patterns(),
                         "handleAuthRequests": False,
                     },
                     session_id,
@@ -554,6 +586,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
                 self._process_target_fallbacks()
                 self._process_finalize_deadlines()
                 self._process_cookie_sync()
+                self._process_client_storage()
         finally:
             if self.running.is_set():
                 self.connection_closed.set()
@@ -654,6 +687,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
                 self._binding_message(session_id, params)
             elif method and method.startswith("DOMStorage.") and self.config.capture_storage:
                 self._dom_storage_event(session_id, method, params)
+            elif method and method.startswith("Storage.") and self.config.capture_client_storage:
+                self._storage_domain_event(session_id, method, params)
             elif method == "Runtime.consoleAPICalled" and self.config.capture_console:
                 self._console_event(session_id, params)
             elif method == "Runtime.exceptionThrown" and self.config.capture_console:
@@ -746,6 +781,9 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
             return
         if kind == "cookie_sync":
             self._handle_cookie_sync(data, error, result)
+            return
+        if kind in {"idb_names", "idb_database", "idb_data", "cache_names", "cache_entries"}:
+            self._handle_client_storage_response(kind, data, error, result)
             return
         if kind == "quiesce":
             self._finish_quiesce_command(data, error)
@@ -892,6 +930,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
                 self._handle_snapshot_response(kind, data, error, {})
             elif kind == "cookie_sync":
                 self._handle_cookie_sync(data, error, {})
+            elif kind in {"idb_names", "idb_database", "idb_data", "cache_names", "cache_entries"}:
+                self._handle_client_storage_response(kind, data, error, {})
             elif kind == "interaction_script":
                 self.store.write_jsonl(
                     "browser/protocol_errors.jsonl",

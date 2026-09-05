@@ -14,3 +14,11 @@ SESSION_GONE_MARKERS = (
     "not attached to an active page",
     "inspected target navigated or closed",
 )
+# Response types that must keep flowing: pausing them to take the body stalls
+# the stream inside Chrome until it ends, which never happens for live feeds.
+STREAMING_CONTENT_TYPES = (
+    "text/event-stream",
+    "multipart/x-mixed-replace",
+    "application/grpc",
+    "application/x-ndjson",
+)

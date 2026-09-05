@@ -101,6 +101,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--body-mode", choices=("none", "api", "all"), default="api")
     parser.add_argument(
+        "--intercept-bodies",
+        choices=("none", "document", "api", "all"),
+        default="api",
+        help="Resource types whose body is taken while the response is paused, which keeps bodies "
+        "for iframes, workers, and pages that close mid-request",
+    )
+    parser.add_argument(
         "--max-body-mb",
         type=_non_negative_finite_float,
         default=32.0,
@@ -121,6 +128,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-console", action="store_true", help="Disable console/log/exception files")
     parser.add_argument("--no-storage", action="store_true", help="Disable cookie and Web Storage snapshots")
+    parser.add_argument(
+        "--no-client-storage",
+        action="store_true",
+        help="Disable IndexedDB and Cache Storage capture",
+    )
+    parser.add_argument(
+        "--max-idb-entries",
+        type=int,
+        default=500,
+        help="Maximum IndexedDB records dumped per object store, per dump",
+    )
+    parser.add_argument(
+        "--max-cache-entries",
+        type=int,
+        default=200,
+        help="Maximum Cache Storage entries dumped per cache, per dump",
+    )
     parser.add_argument("--no-text-compression", action="store_true", help="Do not gzip textual bodies")
     parser.add_argument(
         "--snapshot-interval",
@@ -173,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         output_parent=output_parent,
         profile_dir=profile_dir,
         body_mode=args.body_mode,
+        intercept_bodies=args.intercept_bodies,
         sensitive_mode=args.sensitive,
         max_body_bytes=max(0, int(args.max_body_mb * 1024 * 1024)),
         max_session_body_bytes=max(0, int(args.max_session_body_mb * 1024 * 1024)),
@@ -180,6 +205,9 @@ def main(argv: list[str] | None = None) -> int:
         capture_clipboard=args.capture_clipboard,
         capture_console=not args.no_console,
         capture_storage=not args.no_storage,
+        capture_client_storage=not args.no_storage and not args.no_client_storage,
+        max_idb_entries=args.max_idb_entries,
+        max_cache_entries=args.max_cache_entries,
         compress_text_bodies=not args.no_text_compression,
         snapshot_interval_seconds=args.snapshot_interval,
         durable_messages=args.durable_messages,
@@ -405,7 +433,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             status = "complete"
         try:
-            store.close(status=status, stats=capture.stats if capture else None)
+            store.close(
+                status=status,
+                stats=capture.stats if capture else None,
+                reason=shutdown_reason,
+            )
         except Exception as exc:
             exit_code = 1
             status = "error"
