@@ -14,7 +14,7 @@ import websocket
 from .browser_capture import BrowserCaptureMixin
 from .chrome import fetch_json
 from .config import CaptureConfig
-from .constants import PAGE_TYPES, TARGET_TYPES
+from .constants import PAGE_TYPES, SESSION_GONE_CODES, SESSION_GONE_MARKERS, TARGET_TYPES
 from .models import PendingCommand
 from .network_capture import NetworkCaptureMixin
 from .realtime_capture import RealtimeCaptureMixin
@@ -80,6 +80,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             "protocolErrors": 0,
             "droppedExtraInfo": 0,
             "incompleteFlushed": 0,
+            "detachedSessionCommands": 0,
         }
 
     def _fail_capture(self, message: str, error: BaseException | None = None) -> None:
@@ -91,6 +92,54 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             self.store.add_warning(message)
         except Exception:
             LOG.exception("Could not persist capture failure warning")
+
+    def _session_is_gone(self, session_id: str | None, error: Any = None) -> bool:
+        """Report whether a session-scoped command failed because its target died.
+
+        Short-lived iframes, workers and blob workers routinely detach between
+        the moment a setup command is written to the socket and the moment
+        Chrome answers it. Those replies come back as -32001 "Session with
+        given id not found", which is a race, not a capture-wide fault.
+        Browser-level commands (no session id) stay fatal.
+        """
+        if not session_id:
+            return False
+        with self.state_lock:
+            if session_id not in self.enabled_sessions:
+                return True
+        if isinstance(error, dict):
+            if error.get("code") in SESSION_GONE_CODES:
+                return True
+            message = str(error.get("message") or "").lower()
+            return any(marker in message for marker in SESSION_GONE_MARKERS)
+        return False
+
+    def _handle_required_failure(self, data: dict[str, Any], error: Any, *, timed_out: bool = False) -> None:
+        method = str(data.get("method") or "unknown")
+        session_id = data.get("sessionId")
+        self.stats["protocolErrors"] += 1
+        detached = self._session_is_gone(session_id, error)
+        self.store.write_jsonl(
+            "browser/protocol_errors.jsonl",
+            {
+                "time": self.timestamps.normalize(),
+                "method": method,
+                "sessionId": session_id,
+                "required": True,
+                "timedOut": timed_out,
+                "sessionDetached": detached,
+                "error": error,
+            },
+            redact=True,
+        )
+        if detached:
+            self.stats["detachedSessionCommands"] += 1
+            LOG.debug("Ignoring %s failure for detached session %s: %s", method, session_id, error)
+            return
+        if timed_out:
+            self._fail_capture(f"Required CDP command timed out: {method}", TimeoutError(method))
+        else:
+            self._fail_capture(f"Required CDP command failed: {method}: {error}", RuntimeError(str(error)))
 
     def connect(self) -> bool:
         try:
@@ -282,9 +331,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 redact=True,
             )
         elif kind == "required_command":
-            method = str(data.get("method") or "unknown")
-            self.stats["protocolErrors"] += 1
-            self._fail_capture(f"Required CDP command failed: {method}: {error}", RuntimeError(str(error)))
+            self._handle_required_failure(data, error)
         elif kind == "interaction_binding":
             self.stats["protocolErrors"] += 1
             self.store.add_warning(f"Interaction capture binding failed for session {data.get('sessionId')}: {error}")
@@ -627,20 +674,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             return
         if kind == "required_command":
             if error:
-                method = str(data.get("method") or "unknown")
-                self.stats["protocolErrors"] += 1
-                self.store.write_jsonl(
-                    "browser/protocol_errors.jsonl",
-                    {
-                        "time": self.timestamps.normalize(),
-                        "method": method,
-                        "sessionId": data.get("sessionId"),
-                        "required": True,
-                        "error": error,
-                    },
-                    redact=True,
-                )
-                self._fail_capture(f"Required CDP command failed: {method}: {error}", RuntimeError(str(error)))
+                self._handle_required_failure(data, error)
             return
         if kind == "interaction_binding":
             if error:
@@ -869,9 +903,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                     redact=True,
                 )
             elif kind == "required_command":
-                method = str(data.get("method") or "unknown")
-                self.stats["protocolErrors"] += 1
-                self._fail_capture(f"Required CDP command timed out: {method}", TimeoutError(method))
+                self._handle_required_failure(data, error, timed_out=True)
             elif kind == "interaction_binding":
                 self.stats["protocolErrors"] += 1
                 self.store.add_warning(f"Interaction binding timed out for session {data.get('sessionId')}")

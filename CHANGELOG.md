@@ -2,6 +2,14 @@
 
 All notable changes to Chrome Network Logger are documented here.
 
+## 3.1.1 — 2026-09-05
+
+### Fixed
+
+- Stop aborting the capture when a required session-scoped CDP command fails because its target already detached. Short-lived iframes and blob workers routinely disappear before Chrome answers `Network.enable`, `Page.enable`, or `Target.setAutoAttach`, which returned `-32001 Session with given id not found` and killed the whole session.
+- Record those races in `browser/protocol_errors.jsonl` with `sessionDetached: true` and count them in the new `detachedSessionCommands` statistic. Browser-level required commands (no session id) remain fatal.
+- Treat required-command timeouts for sessions that are no longer attached as non-fatal for the same reason.
+
 ## 3.1.0 — 2026-08-29
 
 ### Managed Chrome fallback

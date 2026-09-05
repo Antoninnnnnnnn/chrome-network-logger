@@ -363,6 +363,7 @@ def test_interaction_binding_accepts_only_the_isolated_world_and_limits_payloads
 
 def test_required_cdp_command_failure_marks_capture_unhealthy(tmp_path: Path) -> None:
     capture, store = make_capture(tmp_path)
+    capture.enabled_sessions.add("s")
     capture.pending[1] = PendingCommand(
         "required_command",
         {"method": "Network.enable", "sessionId": "s"},
@@ -372,6 +373,48 @@ def test_required_cdp_command_failure_marks_capture_unhealthy(tmp_path: Path) ->
     assert capture.failure.is_set()
     assert capture.stats["protocolErrors"] == 1
     assert any("Required CDP command failed" in warning for warning in store.warnings)
+
+
+def test_required_command_failure_on_detached_session_is_not_fatal(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    capture.enabled_sessions.add("s")
+    capture.pending[1] = PendingCommand(
+        "required_command",
+        {"method": "Network.enable", "sessionId": "s"},
+        time.monotonic(),
+    )
+    capture._handle_command_response(
+        {"id": 1, "error": {"code": -32001, "message": "Session with given id not found."}}
+    )
+    assert not capture.failure.is_set()
+    assert capture.stats["detachedSessionCommands"] == 1
+    assert not store.warnings
+    entry = next(payload for path, payload in store.writes if path == "browser/protocol_errors.jsonl")
+    assert entry["sessionDetached"] is True
+
+
+def test_required_command_timeout_on_gone_session_is_not_fatal(tmp_path: Path) -> None:
+    capture, _ = make_capture(tmp_path)
+    capture.pending[1] = PendingCommand(
+        "required_command",
+        {"method": "Page.enable", "sessionId": "gone"},
+        time.monotonic() - 60,
+    )
+    capture._process_pending_timeouts()
+    assert not capture.failure.is_set()
+    assert capture.stats["detachedSessionCommands"] == 1
+
+
+def test_required_browser_command_timeout_is_fatal(tmp_path: Path) -> None:
+    capture, _ = make_capture(tmp_path)
+    capture.pending[1] = PendingCommand(
+        "required_command",
+        {"method": "Target.setAutoAttach", "sessionId": None},
+        time.monotonic() - 60,
+    )
+    capture._process_pending_timeouts()
+    assert capture.failure.is_set()
+    assert isinstance(capture.fatal_error, TimeoutError)
 
 
 def test_connect_rejects_non_loopback_debugger_url(monkeypatch, tmp_path: Path) -> None:
