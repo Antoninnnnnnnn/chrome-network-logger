@@ -40,6 +40,8 @@ Bodies are stored under `network/bodies/` and referenced rather than embedded. A
 
 If the session body limit is reached, the record instead has `omitted: true`, `omittedReason: "sessionBodyLimit"`, `storedBytes: 0`, and `wouldStoreBytes`; it intentionally has no `path`. A decode error is explicit in `decodeError`.
 
+`responseBodyUnavailableReason` explains entries whose response could not carry a body (cancelled request, `HEAD`, `204`/`304`, redirect). Those count in `bodiesUnavailable`, not in `bodyErrors`, which counts only bodies that were lost while they did exist.
+
 ## Other streams
 
 - `timeline.jsonl`: normalized cross-domain summary events.

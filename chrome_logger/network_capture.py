@@ -255,6 +255,45 @@ class NetworkCaptureMixin:
                 ),
             )
 
+    @staticmethod
+    def _body_unavailable_reason(entry: dict[str, Any]) -> str | None:
+        """Explain why a response could never carry a body, if that is the case.
+
+        A cancelled request, a HEAD, a 204/304 or a redirect has no body to
+        fetch, so a failed body command on one of those is not a capture
+        failure. Counting them as body errors made a finished capture look like
+        it had lost data.
+        """
+        request = entry.get("request") or {}
+        response = entry.get("response") or {}
+        failure = entry.get("failure") or {}
+        if not response.get("status"):
+            if failure.get("canceled"):
+                return "the request was cancelled before any response arrived"
+            error_text = failure.get("errorText")
+            if error_text:
+                return f"the request failed before any response arrived ({error_text})"
+            return "no response was received for this request"
+        method = str(request.get("method") or "GET").upper()
+        if method == "HEAD":
+            return "HEAD responses have no body"
+        status = int(response.get("status") or 0)
+        if status in {204, 205, 304}:
+            return f"status {status} responses have no body"
+        if status in REDIRECT_CODES:
+            return "CDP does not expose redirect response bodies"
+        return None
+
+    def _record_body_failure(self, entry: dict[str, Any], field: str, error: Any) -> None:
+        """Record a failed body command, separating real losses from non-bodies."""
+        entry[field] = error
+        reason = self._body_unavailable_reason(entry)
+        if reason is None:
+            self.stats["bodyErrors"] += 1
+            return
+        entry.setdefault("responseBodyUnavailableReason", reason)
+        self.stats["bodiesUnavailable"] += 1
+
     def _body_must_stream(self, content_type: str | None, headers: dict[str, str]) -> bool:
         """Report whether pausing for the body would break or bloat the response."""
         normalized = (content_type or "").lower()

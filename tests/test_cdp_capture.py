@@ -648,3 +648,39 @@ def test_snapshot_targets_page_sessions(tmp_path: Path) -> None:
     assert ("Storage.getCookies", None) in sent
     assert ("Runtime.evaluate", "s") in sent
     assert ("Runtime.evaluate", "w") not in sent
+
+
+def test_body_failure_on_a_cancelled_request_is_not_counted_as_a_lost_body(tmp_path: Path) -> None:
+    capture, _ = make_capture(tmp_path)
+    entry = {
+        "request": {"method": "GET", "url": "https://example.test/api"},
+        "failure": {"errorText": "net::ERR_ABORTED", "canceled": True},
+    }
+    capture._record_body_failure(entry, "fetchResponseBodyError", {"message": "Invalid InterceptionId."})
+    assert capture.stats["bodyErrors"] == 0
+    assert capture.stats["bodiesUnavailable"] == 1
+    assert entry["responseBodyUnavailableReason"] == "the request was cancelled before any response arrived"
+    assert entry["fetchResponseBodyError"] == {"message": "Invalid InterceptionId."}
+
+
+def test_body_failure_on_a_real_response_is_still_a_lost_body(tmp_path: Path) -> None:
+    capture, _ = make_capture(tmp_path)
+    entry = {"request": {"method": "GET"}, "response": {"status": 200}}
+    capture._record_body_failure(entry, "responseBodyError", {"message": "No data found"})
+    assert capture.stats["bodyErrors"] == 1
+    assert capture.stats["bodiesUnavailable"] == 0
+    assert "responseBodyUnavailableReason" not in entry
+
+
+def test_responses_that_cannot_carry_a_body_are_explained(tmp_path: Path) -> None:
+    capture, _ = make_capture(tmp_path)
+    reason = capture._body_unavailable_reason
+    assert reason({"request": {"method": "HEAD"}, "response": {"status": 200}}) == "HEAD responses have no body"
+    assert reason({"request": {}, "response": {"status": 204}}) == "status 204 responses have no body"
+    assert reason({"request": {}, "response": {"status": 304}}) == "status 304 responses have no body"
+    assert reason({"request": {}, "response": {"status": 302}}) == "CDP does not expose redirect response bodies"
+    assert reason({"request": {}, "response": {"status": 200}}) is None
+    assert reason({"request": {}, "failure": {"errorText": "net::ERR_FAILED"}}) == (
+        "the request failed before any response arrived (net::ERR_FAILED)"
+    )
+    assert reason({"request": {}}) == "no response was received for this request"

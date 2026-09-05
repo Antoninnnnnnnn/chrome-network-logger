@@ -9,6 +9,12 @@ All notable changes to Chrome Network Logger are documented here.
 - Stop configuring CDP durable messages. On Chrome 152 that call makes the network service drop retained response bodies, so every `Network.getResponseBody` returned `No data found for resource with given identifier` and no body was captured. A local reproduction went from 0/30 to 30/30 bodies once the call was removed.
 - Add `--durable-messages` for anyone who wants the old behaviour, documented as breaking body retrieval.
 
+### Fixed — body errors that were not errors
+
+- Stop counting a failed body command as a lost body when the response could never carry one. A cancelled request, a `HEAD`, a `204`/`304` or a redirect has no body to fetch, so `Fetch.getResponseBody` answering `Invalid InterceptionId.` for an aborted request was not a capture failure.
+- Those cases now set `responseBodyUnavailableReason` on the entry and count in the new `bodiesUnavailable` statistic; `bodyErrors` keeps only real losses. Replaying a 3 764-request capture that reported 36 `bodyErrors` gives 0 real losses and 36 responses that never had a body.
+- The end-of-session summary distinguishes both: "bodies lost to errors" and a separate line for responses with no body to capture.
+
 ### Raw capture by default
 
 - `--sensitive` now defaults to `raw`: bodies, cookies, tokens and form values are stored as captured, so a session is directly usable for debugging the application that produced it. Redaction becomes opt-in with `--sensitive safe`.

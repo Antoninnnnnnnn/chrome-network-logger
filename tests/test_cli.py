@@ -161,16 +161,22 @@ def test_session_summary_states_that_data_was_saved(capsys, tmp_path: Path) -> N
     output = capsys.readouterr().out
     assert "Capture stopped: you closed the browser" in output
     assert "All captured data was written to disk." in output
-    assert "Requests: 120 | bodies stored: 44 | bodies unavailable: 0" in output
+    assert "Requests: 120 | bodies stored: 44 | bodies lost to errors: 0" in output
     assert "IndexedDB records: 12 | Cache Storage entries: 5" in output
     assert "in flight" not in output
     assert "reports" in output and "requests.jsonl" in output
 
 
 def test_session_summary_reports_in_flight_requests_and_errors(capsys, tmp_path: Path) -> None:
-    cli._print_session_summary(tmp_path / "session_y", "partial", "signal:2", {"incompleteFlushed": 7})
+    cli._print_session_summary(
+        tmp_path / "session_y",
+        "partial",
+        "signal:2",
+        {"incompleteFlushed": 7, "bodiesUnavailable": 36},
+    )
     output = capsys.readouterr().out
     assert "7 request(s) were still in flight" in output
+    assert "36 response(s) had no body to capture" in output
 
     cli._print_session_summary(tmp_path / "session_z", "error", "error:OSError", None)
     output = capsys.readouterr().out

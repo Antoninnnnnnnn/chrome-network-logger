@@ -88,6 +88,7 @@ class CDPCapture(
             "responses": 0,
             "bodies": 0,
             "bodyErrors": 0,
+            "bodiesUnavailable": 0,
             "failures": 0,
             "redirects": 0,
             "webSocketFrames": 0,
@@ -291,8 +292,7 @@ class CDPCapture(
                 entry = self.registry.entries.get(key)
                 if entry:
                     entry["_pendingResponseBody"] = False
-                    entry["responseBodyError"] = error
-                    self.stats["bodyErrors"] += 1
+                    self._record_body_failure(entry, "responseBodyError", error)
                     self._schedule_finalize(key, "bodySendFailed", delay=0.01)
         elif kind == "fetch_body":
             key = str(data.get("key") or "")
@@ -302,8 +302,7 @@ class CDPCapture(
                 entry = self.registry.entries.get(key)
                 if entry:
                     entry["_pendingFetchBody"] = False
-                    entry["fetchResponseBodyError"] = error
-                    self.stats["bodyErrors"] += 1
+                    self._record_body_failure(entry, "fetchResponseBodyError", error)
                     if entry.get("_loadingComplete"):
                         self._request_network_body_fallback(key, "fetchBodySendFailed")
             if fetch_id:
@@ -830,8 +829,7 @@ class CDPCapture(
                 if entry:
                     entry["_pendingResponseBody"] = False
                     if error:
-                        entry["responseBodyError"] = error
-                        self.stats["bodyErrors"] += 1
+                        self._record_body_failure(entry, "responseBodyError", error)
                     else:
                         self._store_response_body(entry, result.get("body"), bool(result.get("base64Encoded")))
                     self._schedule_finalize(key, reason="loadingFinished")
@@ -845,8 +843,7 @@ class CDPCapture(
                 if entry:
                     entry["_pendingFetchBody"] = False
                     if error:
-                        entry["fetchResponseBodyError"] = error
-                        self.stats["bodyErrors"] += 1
+                        self._record_body_failure(entry, "fetchResponseBodyError", error)
                     else:
                         self._store_response_body(
                             entry,
@@ -905,8 +902,7 @@ class CDPCapture(
                     entry = self.registry.entries.get(key)
                     if entry:
                         entry["_pendingFetchBody"] = False
-                        entry["fetchResponseBodyError"] = error
-                        self.stats["bodyErrors"] += 1
+                        self._record_body_failure(entry, "fetchResponseBodyError", error)
                         if entry.get("_loadingComplete"):
                             self._request_network_body_fallback(key, "fetchBodyTimeout")
                 fetch_id = str(data["fetchId"])
@@ -919,8 +915,7 @@ class CDPCapture(
                     entry = self.registry.entries.get(key)
                     if entry:
                         entry["_pendingResponseBody"] = False
-                        entry["responseBodyError"] = error
-                        self.stats["bodyErrors"] += 1
+                        self._record_body_failure(entry, "responseBodyError", error)
                         self._schedule_finalize(key, "bodyTimeout", delay=0.01)
             elif kind == "request_post_data":
                 key = str(data["key"])

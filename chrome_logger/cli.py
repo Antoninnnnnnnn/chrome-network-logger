@@ -214,7 +214,10 @@ def _print_session_summary(base: Path, status: str, reason: str, stats: dict[str
     requests = stats.get("requests", 0)
     bodies = stats.get("bodies", 0)
     body_errors = stats.get("bodyErrors", 0)
-    print(f"  Requests: {requests} | bodies stored: {bodies} | bodies unavailable: {body_errors}")
+    print(f"  Requests: {requests} | bodies stored: {bodies} | bodies lost to errors: {body_errors}")
+    no_body = stats.get("bodiesUnavailable", 0)
+    if no_body:
+        print(f"  {no_body} response(s) had no body to capture (cancelled, HEAD, 204/304, or redirect).")
     state = (
         f"  Cookie changes: {stats.get('cookieChanges', 0)} | "
         f"Web Storage changes: {stats.get('storageChanges', 0)} | "
