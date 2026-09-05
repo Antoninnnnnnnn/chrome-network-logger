@@ -94,6 +94,7 @@ Important options:
 | `--capture-clipboard` | Capture pasted text; redacted in safe mode |
 | `--no-console` | Disable console, exceptions, and Log-domain files |
 | `--no-storage` | Disable cookie and Web Storage snapshots |
+| `--snapshot-interval 30` | Refresh cookie/storage snapshots every N seconds so a closed browser keeps recent state; `0` disables |
 | `--keep-chrome` | Leave Chrome open after disabling Fetch, auto-attach, and injected listeners |
 | `--duration SECONDS` | Stop and finalize automatically; must be finite and non-negative |
 | `--start-url URL` | Initial page; defaults to `about:blank` to avoid unsolicited new-tab traffic |

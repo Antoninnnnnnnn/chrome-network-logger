@@ -616,3 +616,35 @@ def test_websocket_and_webtransport_lifecycles(tmp_path: Path) -> None:
     assert not capture.webtransports
     assert any(path == "realtime/webtransport.jsonl" for path, _ in store.writes)
     assert capture.stats["webTransports"] == 1
+
+
+def test_send_after_socket_close_marks_connection_closed(tmp_path: Path) -> None:
+    import websocket
+
+    capture, _ = make_capture(tmp_path)
+
+    class DeadSocket:
+        def send(self, _payload: str) -> None:
+            raise websocket.WebSocketConnectionClosedException("socket is already closed.")
+
+    capture.ws = DeadSocket()  # type: ignore[assignment]
+    assert capture.is_live()
+    capture.send("Storage.getCookies", {})
+    assert capture.connection_closed.is_set()
+    assert not capture.is_live()
+    assert not capture.failure.is_set()
+
+
+def test_snapshot_targets_page_sessions(tmp_path: Path) -> None:
+    capture, _ = make_capture(tmp_path)
+    sent: list[tuple[str, str | None]] = []
+    capture.send = lambda method, params=None, session_id=None, pending=None: (  # type: ignore[method-assign]
+        sent.append((method, session_id)),
+        0,
+    )[1]
+    capture.targets["s"] = {"targetId": "target-1", "type": "page", "url": "https://example.test"}
+    capture.targets["w"] = {"targetId": "target-2", "type": "worker", "url": "https://example.test/w.js"}
+    capture.snapshot("interval")
+    assert ("Storage.getCookies", None) in sent
+    assert ("Runtime.evaluate", "s") in sent
+    assert ("Runtime.evaluate", "w") not in sent

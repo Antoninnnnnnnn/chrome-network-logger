@@ -35,6 +35,9 @@ class CaptureConfig:
     websocket_inline_limit: int = 64 * 1024
     finalize_grace_seconds: float = 0.25
     shutdown_wait_seconds: float = 2.0
+    # Cookies and Web Storage can only be read while the browser lives, so keep
+    # a recent copy on disk for sessions that end with the window being closed.
+    snapshot_interval_seconds: float = 30.0
     writer_queue_size: int = 20_000
     max_interaction_payload_bytes: int = 256 * 1024
     log_level: str = "INFO"
@@ -60,3 +63,6 @@ class CaptureConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a positive finite number")
+        interval = float(self.snapshot_interval_seconds)
+        if not math.isfinite(interval) or interval < 0:
+            raise ValueError("snapshot_interval_seconds must be a finite number >= 0")

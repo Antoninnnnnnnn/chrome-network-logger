@@ -4,6 +4,12 @@ All notable changes to Chrome Network Logger are documented here.
 
 ## 3.1.1 — 2026-09-05
 
+### Browser shutdown
+
+- Snapshot cookies and Web Storage every 30 seconds during capture (`--snapshot-interval`, `0` disables) so closing the browser window still leaves recent state in `snapshots/`.
+- Skip the final snapshot and CDP teardown when the browser is already gone instead of retrying on a dead socket, and report it as a single warning rather than four `WebSocketConnectionClosedException` tracebacks.
+- Mark the CDP connection as closed as soon as a send hits a closed socket.
+
 ### Fixed
 
 - Stop aborting the capture when a required session-scoped CDP command fails because its target already detached. Short-lived iframes and blob workers routinely disappear before Chrome answers `Network.enable`, `Page.enable`, or `Target.setAutoAttach`, which returned `-32001 Session with given id not found` and killed the whole session.

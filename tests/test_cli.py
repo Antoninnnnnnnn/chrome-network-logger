@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import chrome_logger
 from chrome_logger import cli
 
 
@@ -21,7 +22,7 @@ def test_version_output_is_stable(capsys) -> None:
     with pytest.raises(SystemExit) as error:
         cli.build_parser().parse_args(["--version"])
     assert error.value.code == 0
-    assert capsys.readouterr().out == "chrome-network-logger 3.1.0\n"
+    assert capsys.readouterr().out == f"chrome-network-logger {chrome_logger.__version__}\n"
 
 
 def test_start_url_rejects_flags_and_unsupported_schemes() -> None:

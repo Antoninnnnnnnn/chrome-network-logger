@@ -94,6 +94,7 @@ Options importantes :
 | `--capture-clipboard` | Capture les collages ; masqués en mode `safe` |
 | `--no-console` | Désactive console, exceptions et domaine `Log` |
 | `--no-storage` | Désactive snapshots cookies/localStorage/sessionStorage |
+| `--snapshot-interval 30` | Rafraîchit les snapshots cookies/storage toutes les N secondes pour garder un état récent si le navigateur est fermé ; `0` désactive |
 | `--keep-chrome` | Laisse Chrome ouvert après avoir désactivé Fetch, l'auto-attach et les listeners injectés |
 | `--duration SECONDES` | Arrête et finalise automatiquement ; valeur finie et positive ou nulle |
 | `--start-url URL` | Page initiale ; `about:blank` par défaut évite le trafic spontané du nouvel onglet |

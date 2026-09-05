@@ -232,6 +232,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             with self.send_lock:
                 self.ws.send(encoded)
         except Exception as exc:
+            if isinstance(exc, websocket.WebSocketConnectionClosedException):
+                self.connection_closed.set()
             with self.state_lock:
                 failed = self.pending.pop(message_id, None)
             if failed:
@@ -239,9 +241,17 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                     failed,
                     {"code": -1, "message": f"CDP send failed ({method}): {exc}"},
                 )
-            if self.running.is_set():
+            if not self.is_live():
+                # The browser went away; a dead socket is expected here and the
+                # session is finalized from the data already on disk.
+                LOG.debug("CDP send skipped after disconnect: %s (%s)", method, exc)
+            elif self.running.is_set():
                 LOG.exception("CDP send failed: %s", method)
         return message_id
+
+    def is_live(self) -> bool:
+        """Report whether commands can still reach the browser."""
+        return bool(self.ws) and self.running.is_set() and not self.connection_closed.is_set()
 
     def _handle_send_failure(self, command: PendingCommand, error: dict[str, Any]) -> None:
         kind = command.kind

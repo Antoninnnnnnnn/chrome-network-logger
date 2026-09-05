@@ -123,6 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-storage", action="store_true", help="Disable cookie and Web Storage snapshots")
     parser.add_argument("--no-text-compression", action="store_true", help="Do not gzip textual bodies")
     parser.add_argument(
+        "--snapshot-interval",
+        type=_non_negative_finite_float,
+        default=30.0,
+        help="Refresh cookie/storage snapshots every N seconds so a closed browser keeps recent state; 0 disables",
+    )
+    parser.add_argument(
         "--proxy",
         metavar="N|random|none",
         default="none",
@@ -170,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         capture_console=not args.no_console,
         capture_storage=not args.no_storage,
         compress_text_bodies=not args.no_text_compression,
+        snapshot_interval_seconds=args.snapshot_interval,
         log_level=args.log_level,
     )
     config.validate()
@@ -310,8 +317,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nCapture active: {store.base.resolve()}")
         print("Press Ctrl+C to stop and finalize the session.")
 
+        snapshot_interval = config.snapshot_interval_seconds if config.capture_storage else 0.0
+        next_snapshot = time.monotonic() + snapshot_interval if snapshot_interval else None
         while not stop_requested.wait(0.5):
             store.check_health()
+            if next_snapshot is not None and time.monotonic() >= next_snapshot:
+                # Keep a fresh copy on disk: cookies and Web Storage are
+                # unreachable once the user closes the browser window.
+                capture.snapshot("interval")
+                next_snapshot = time.monotonic() + snapshot_interval
             if chrome.process.poll() is not None:
                 shutdown_reason = "chromeExited"
                 break
@@ -335,17 +349,27 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         keyboard_stop.set()
         if capture and capture_connected:
+            browser_live = capture.is_live() and not (chrome and chrome.process.poll() is not None)
+            if not browser_live:
+                # The browser is already gone: cookies and Web Storage cannot be
+                # read any more, so finalize from what is on disk instead of
+                # waiting out every shutdown timeout on a dead socket.
+                safe_warning(
+                    "Browser closed before shutdown; keeping captured data and the last interval snapshot"
+                )
+            if browser_live:
+                try:
+                    capture.snapshot("end")
+                    if not capture.wait_for_snapshots(config.shutdown_wait_seconds):
+                        safe_warning("Timed out while waiting for final cookie/storage snapshots")
+                except Exception as exc:
+                    safe_warning(f"Final snapshot failed: {exc}")
             try:
-                capture.snapshot("end")
-                if not capture.wait_for_snapshots(config.shutdown_wait_seconds):
-                    safe_warning("Timed out while waiting for final cookie/storage snapshots")
-            except Exception as exc:
-                safe_warning(f"Final snapshot failed: {exc}")
-            try:
-                if not capture.wait_for_pending_data(config.shutdown_wait_seconds):
-                    safe_warning("Timed out while waiting for pending response/request bodies")
-                if not capture.quiesce(config.shutdown_wait_seconds):
-                    safe_warning("Timed out while waiting for CDP instrumentation teardown")
+                if browser_live:
+                    if not capture.wait_for_pending_data(config.shutdown_wait_seconds):
+                        safe_warning("Timed out while waiting for pending response/request bodies")
+                    if not capture.quiesce(config.shutdown_wait_seconds):
+                        safe_warning("Timed out while waiting for CDP instrumentation teardown")
                 capture.flush_open(shutdown_reason)
             except Exception as exc:
                 exit_code = 1
