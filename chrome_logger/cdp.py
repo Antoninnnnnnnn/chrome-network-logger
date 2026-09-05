@@ -19,13 +19,14 @@ from .models import PendingCommand
 from .network_capture import NetworkCaptureMixin
 from .realtime_capture import RealtimeCaptureMixin
 from .registry import RequestRegistry
+from .state_capture import StateCaptureMixin
 from .storage import CaptureStore
 from .timestamps import TimestampMapper
 
 LOG = logging.getLogger(__name__)
 
 
-class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin):
+class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin, StateCaptureMixin):
     def __init__(self, port: int, config: CaptureConfig, store: CaptureStore):
         self.port = port
         self.config = config
@@ -64,6 +65,13 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
         self._quiesce_pending = 0
         self._snapshot_pending = 0
         self._protocol_warnings: set[str] = set()
+        # Event-sourced cookie and Web Storage state; see StateCaptureMixin.
+        self._cookie_state: dict[str, dict[str, Any]] = {}
+        self._cookie_sync_reasons: set[str] = set()
+        self._cookie_sync_inflight = False
+        self._cookie_sync_earliest = 0.0
+        self._cookie_baseline_written = False
+        self._dom_storage: dict[str, dict[str, Any]] = {}
         self.stats = {
             "requests": 0,
             "responses": 0,
@@ -81,6 +89,11 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             "droppedExtraInfo": 0,
             "incompleteFlushed": 0,
             "detachedSessionCommands": 0,
+            "cookieSyncs": 0,
+            "cookieChanges": 0,
+            "storageChanges": 0,
+            "storageFlushes": 0,
+            "droppedStorageFlushes": 0,
         }
 
     def _fail_capture(self, message: str, error: BaseException | None = None) -> None:
@@ -290,6 +303,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                         self._schedule_finalize(key, "postDataSendFailed", delay=0.01)
         elif kind in {"snapshot_cookies", "snapshot_storage"}:
             self._handle_snapshot_response(kind, data, error, {})
+        elif kind == "cookie_sync":
+            self._handle_cookie_sync(data, error, {})
         elif kind == "interaction_script":
             self.store.write_jsonl(
                 "browser/protocol_errors.jsonl",
@@ -432,6 +447,20 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 time.monotonic(),
             ),
         )
+        if target_info.get("type") in PAGE_TYPES and self.config.capture_storage:
+            # Every localStorage/sessionStorage mutation arrives as an event;
+            # the attach-time dump below is the baseline they apply to.
+            self.send(
+                "DOMStorage.enable",
+                session_id=session_id,
+                pending=PendingCommand(
+                    "capability",
+                    {"method": "DOMStorage.enable", "sessionId": session_id},
+                    time.monotonic(),
+                ),
+            )
+            self.snapshot("attach", sessions=[session_id], include_cookies=False)
+            self.request_cookie_sync("targetAttached")
         if target_info.get("type") in PAGE_TYPES:
             self.send(
                 "Page.enable",
@@ -521,6 +550,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 self._process_pending_timeouts()
                 self._process_target_fallbacks()
                 self._process_finalize_deadlines()
+                self._process_cookie_sync()
         finally:
             if self.running.is_set():
                 self.connection_closed.set()
@@ -618,7 +648,9 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                 with self.state_lock:
                     self.interaction_contexts.pop(session_id or "", None)
             elif method == "Runtime.bindingCalled" and params.get("name") == self.binding_name:
-                self._user_event(session_id, params)
+                self._binding_message(session_id, params)
+            elif method and method.startswith("DOMStorage.") and self.config.capture_storage:
+                self._dom_storage_event(session_id, method, params)
             elif method == "Runtime.consoleAPICalled" and self.config.capture_console:
                 self._console_event(session_id, params)
             elif method == "Runtime.exceptionThrown" and self.config.capture_console:
@@ -708,6 +740,9 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             elif session_id:
                 with self.state_lock:
                     self.interaction_script_ids[session_id] = str(identifier)
+            return
+        if kind == "cookie_sync":
+            self._handle_cookie_sync(data, error, result)
             return
         if kind == "quiesce":
             self._finish_quiesce_command(data, error)
@@ -852,6 +887,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
                             self._schedule_finalize(key, "postDataTimeout", delay=0.01)
             elif kind in {"snapshot_cookies", "snapshot_storage"}:
                 self._handle_snapshot_response(kind, data, error, {})
+            elif kind == "cookie_sync":
+                self._handle_cookie_sync(data, error, {})
             elif kind == "interaction_script":
                 self.store.write_jsonl(
                     "browser/protocol_errors.jsonl",
@@ -969,6 +1006,7 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             self.interaction_script_ids.pop(session_id, None)
             self.interaction_contexts.pop(session_id, None)
             self.enabled_sessions.discard(session_id)
+            page_gone = bool(target and target.get("type") in PAGE_TYPES)
             if target and target.get("targetId"):
                 target_id = str(target["targetId"])
                 self.target_sessions.pop(target_id, None)
@@ -984,6 +1022,9 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             },
             redact=True,
         )
+        if page_gone:
+            # A closing page may have written cookies the jar still holds.
+            self.request_cookie_sync("targetDetached")
 
     def wait_for_pending_data(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -1068,6 +1109,8 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin)
             if info.get("type") in PAGE_TYPES:
                 if self.config.body_mode != "none":
                     self._send_quiesce("Fetch.disable", {}, session_id)
+                if self.config.capture_storage:
+                    self._send_quiesce("DOMStorage.disable", {}, session_id)
                 if self.config.capture_interactions:
                     for context_id in interaction_contexts.get(session_id, set()):
                         self._send_quiesce(

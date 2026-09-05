@@ -4,9 +4,16 @@ All notable changes to Chrome Network Logger are documented here.
 
 ## 3.1.1 — 2026-09-05
 
+### Event-sourced cookie and Web Storage capture
+
+- Record every `localStorage`/`sessionStorage` mutation from `DOMStorage` events into `storage/dom_storage_events.jsonl`, using the attach-time page dump as the baseline they apply to.
+- Re-read the cookie jar after each event that can change it (Set-Cookie response, navigation, target attach/detach, page flush) and store the diff in `storage/cookie_changes.jsonl`. Bursts coalesce into a single read.
+- Flush a full `localStorage`/`sessionStorage`/cookie dump from the injected script on `pagehide`, `freeze`, `unload`, `beforeunload`, and `visibilitychange` — the last moment a dying page is readable — into `storage/page_flushes.jsonl`. Safe mode exports cookie names only.
+- Write `snapshots/cookies_final.json` and `snapshots/dom_storage_final.json` from that in-memory state at shutdown, so a session ended by closing the browser keeps its final state without a live connection.
+- Turn the periodic snapshot into an optional extra (`--snapshot-interval`, now `0` by default) instead of the mechanism state capture relies on.
+
 ### Browser shutdown
 
-- Snapshot cookies and Web Storage every 30 seconds during capture (`--snapshot-interval`, `0` disables) so closing the browser window still leaves recent state in `snapshots/`.
 - Skip the final snapshot and CDP teardown when the browser is already gone instead of retrying on a dead socket, and report it as a single warning rather than four `WebSocketConnectionClosedException` tracebacks.
 - Mark the CDP connection as closed as soon as a send hits a closed socket.
 

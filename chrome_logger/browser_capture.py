@@ -92,17 +92,26 @@ class BrowserCaptureMixin:
         }
         self.store.write_jsonl("browser/navigations.jsonl", event, redact=True)
         self.store.timeline("navigation", timestamp, event=event_name, sessionId=session_id, params=params)
+        if event_name == "frameNavigated":
+            self.request_cookie_sync("frameNavigated")
 
-    def snapshot(self, label: str) -> None:
+    def snapshot(
+        self,
+        label: str,
+        *,
+        sessions: list[str] | None = None,
+        include_cookies: bool = True,
+    ) -> None:
         if not self.config.capture_storage:
             return
-        with self.state_lock:
-            self._snapshot_pending += 1
-        self.send(
-            "Storage.getCookies",
-            {},
-            pending=PendingCommand("snapshot_cookies", {"label": label}, time.monotonic()),
-        )
+        if include_cookies:
+            with self.state_lock:
+                self._snapshot_pending += 1
+            self.send(
+                "Storage.getCookies",
+                {},
+                pending=PendingCommand("snapshot_cookies", {"label": label}, time.monotonic()),
+            )
         expression = """(() => {
             const dump = (name, storageFactory) => {
                 try {
@@ -124,8 +133,9 @@ class BrowserCaptureMixin:
                 sessionStorage: dump('sessionStorage', () => window.sessionStorage)
             };
         })()"""
-        with self.state_lock:
-            sessions = [sid for sid, info in self.targets.items() if info.get("type") in PAGE_TYPES]
+        if sessions is None:
+            with self.state_lock:
+                sessions = [sid for sid, info in self.targets.items() if info.get("type") in PAGE_TYPES]
         for session_id in sessions:
             with self.state_lock:
                 self._snapshot_pending += 1
@@ -155,6 +165,8 @@ class BrowserCaptureMixin:
                     payload["error"] = error
                 else:
                     payload["cookies"] = result.get("cookies") or []
+                    # Keep the event-sourced jar aligned with explicit snapshots.
+                    self._handle_cookie_sync({"reasons": [f"snapshot:{label}"]}, None, result)
                 self.store.write_json(f"snapshots/cookies_{label}.json", payload, redact=True)
             else:
                 payload = {
@@ -173,6 +185,9 @@ class BrowserCaptureMixin:
                     payload["storage"] = remote.get("value")
                     if remote.get("subtype") == "error":
                         payload["error"] = remote.get("description")
+                    dump = remote.get("value")
+                    if isinstance(dump, dict):
+                        self.seed_dom_storage(str(dump.get("origin") or ""), dump, f"dump:{label}")
                 self.store.write_jsonl(f"snapshots/storage_{label}.jsonl", payload, redact=True)
         finally:
             with self._snapshot_condition:
@@ -332,9 +347,53 @@ class BrowserCaptureMixin:
       emit({...base('paste', e.target), data: SAFE ? redact(text) : text.slice(0, 10000)});
     }, listenerOptions);
   }
+  const dumpStorage = (factory) => {
+    try {
+      const storage = factory();
+      const values = {};
+      for (let i = 0; i < storage.length; i++) {
+        const key = storage.key(i);
+        values[key] = storage.getItem(key);
+      }
+      return {ok: true, values};
+    } catch (error) {
+      return {ok: false, error: String(error)};
+    }
+  };
+  const cookieState = () => {
+    let raw = '';
+    try { raw = String(document.cookie || ''); } catch (_) { return null; }
+    if (!SAFE) return raw;
+    const names = raw.split(';').map((part) => part.split('=')[0].trim()).filter(Boolean);
+    return {names, count: names.length, length: raw.length};
+  };
+  // Last chance to read a page that is being closed, hidden, or frozen: the
+  // renderer dies with the window, so the dump travels with this message
+  // instead of needing a round trip.
+  let lastFlush = 0;
+  const flushState = (trigger) => {
+    const now = Date.now();
+    if (trigger === 'hidden' && now - lastFlush < 500) return;
+    lastFlush = now;
+    emit({
+      event: 'storage_state', ts: now, trigger, url: location.href, origin: location.origin,
+      localStorage: dumpStorage(() => window.localStorage),
+      sessionStorage: dumpStorage(() => window.sessionStorage),
+      cookie: cookieState()
+    });
+  };
+  window.addEventListener('pagehide', () => flushState('pagehide'), listenerOptions);
+  window.addEventListener('freeze', () => flushState('freeze'), listenerOptions);
+  window.addEventListener('unload', () => flushState('unload'), listenerOptions);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushState('hidden');
+  }, listenerOptions);
   window.addEventListener('popstate', () => emit({event: 'popstate', ts: Date.now(), url: location.href}), listenerOptions);
   window.addEventListener('hashchange', (e) => emit({event: 'hashchange', ts: Date.now(), url: location.href, oldURL: e.oldURL, newURL: e.newURL}), listenerOptions);
-  window.addEventListener('beforeunload', () => emit({event: 'beforeunload', ts: Date.now(), url: location.href}), listenerOptions);
+  window.addEventListener('beforeunload', () => {
+    emit({event: 'beforeunload', ts: Date.now(), url: location.href});
+    flushState('beforeunload');
+  }, listenerOptions);
 })();
 """
         return (

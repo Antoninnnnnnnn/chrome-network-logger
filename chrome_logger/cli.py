@@ -125,8 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--snapshot-interval",
         type=_non_negative_finite_float,
-        default=30.0,
-        help="Refresh cookie/storage snapshots every N seconds so a closed browser keeps recent state; 0 disables",
+        default=0.0,
+        help="Extra periodic cookie/storage snapshot every N seconds; 0 relies on event capture alone",
     )
     parser.add_argument(
         "--proxy",
@@ -351,11 +351,10 @@ def main(argv: list[str] | None = None) -> int:
         if capture and capture_connected:
             browser_live = capture.is_live() and not (chrome and chrome.process.poll() is not None)
             if not browser_live:
-                # The browser is already gone: cookies and Web Storage cannot be
-                # read any more, so finalize from what is on disk instead of
-                # waiting out every shutdown timeout on a dead socket.
+                # The browser is already gone, so finalize from the event-sourced
+                # state instead of waiting out shutdown timeouts on a dead socket.
                 safe_warning(
-                    "Browser closed before shutdown; keeping captured data and the last interval snapshot"
+                    "Browser closed before shutdown; writing the state rebuilt from captured events"
                 )
             if browser_live:
                 try:
@@ -371,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
                     if not capture.quiesce(config.shutdown_wait_seconds):
                         safe_warning("Timed out while waiting for CDP instrumentation teardown")
                 capture.flush_open(shutdown_reason)
+                capture.write_final_state()
             except Exception as exc:
                 exit_code = 1
                 shutdown_reason = f"error:{type(exc).__name__}"

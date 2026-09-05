@@ -20,14 +20,14 @@ Outil Python pour capturer le **trafic applicatif visible par Chrome** avec le C
 - WebSocket et SSE écrits au fil de l'eau, sans accumulation illimitée en mémoire.
 - Une seule source canonique : `network/requests.jsonl`.
 - Timestamps normalisés (`epochMs`, ISO local et horloge monotone CDP quand disponible).
-- Cookies et `localStorage`/`sessionStorage` photographiés au début et à la fin.
+- Cookies et Web Storage capturés par événements, pas par échantillons : chaque mutation `DOMStorage`, un diff du jar après chaque événement qui peut le changer, et un dump complet de la page sur `pagehide`/`freeze`/`visibilitychange` pour que fermer le navigateur conserve l'état final.
 - Console, exceptions, logs navigateur et navigations enregistrés dans des fichiers dédiés.
 - Script d’interactions installé dans un monde JavaScript isolé ; en mode sûr, toutes les valeurs de formulaire sont masquées et aucun `outerHTML` brut n’est exporté.
 - Secrets masqués par défaut avec une longueur et un HMAC propre à la session, sans perdre l'information qu'une valeur existait.
 - Relay proxy réécrit : sockets correctement suivis/fermés, IPv6, proxy HTTP ou HTTPS, bascule directe en live sous Windows.
 - Les erreurs fatales CDP/writer produisent un manifeste `error` et un code de sortie non nul, sans faux succès.
 - Payloads d’interaction, `ExtraInfo` en attente, connexions proxy et file du writer sont bornés.
-- Package typé, 96 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
+- Package typé, 115 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
 - Si aucun Chrome local n’existe, téléchargement et mise en cache automatiques du Chrome for Testing Stable officiel, sans ChromeDriver.
 
 ## Installation
@@ -94,7 +94,7 @@ Options importantes :
 | `--capture-clipboard` | Capture les collages ; masqués en mode `safe` |
 | `--no-console` | Désactive console, exceptions et domaine `Log` |
 | `--no-storage` | Désactive snapshots cookies/localStorage/sessionStorage |
-| `--snapshot-interval 30` | Rafraîchit les snapshots cookies/storage toutes les N secondes pour garder un état récent si le navigateur est fermé ; `0` désactive |
+| `--snapshot-interval 0` | Snapshot cookies/storage périodique supplémentaire toutes les N secondes ; `0` s'appuie uniquement sur la capture par événements |
 | `--keep-chrome` | Laisse Chrome ouvert après avoir désactivé Fetch, l'auto-attach et les listeners injectés |
 | `--duration SECONDES` | Arrête et finalise automatiquement ; valeur finie et positive ou nulle |
 | `--start-url URL` | Page initiale ; `about:blank` par défaut évite le trafic spontané du nouvel onglet |
@@ -135,10 +135,17 @@ session_YYYYMMDD_HHMMSS_mmm_PID_ALÉA/
 │   ├── protocol_errors.jsonl
 │   ├── protocol_capabilities.jsonl
 │   └── proxy_toggles.jsonl
+├── storage/
+│   ├── cookie_changes.jsonl
+│   ├── dom_storage_events.jsonl
+│   └── page_flushes.jsonl
 ├── snapshots/
 │   ├── cookies_start.json
 │   ├── cookies_end.json
+│   ├── cookies_final.json
+│   ├── dom_storage_final.json
 │   ├── storage_start.jsonl
+│   ├── storage_attach.jsonl
 │   └── storage_end.jsonl
 └── reports/
     ├── summary.txt

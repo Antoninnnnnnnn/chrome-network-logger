@@ -35,9 +35,10 @@ class CaptureConfig:
     websocket_inline_limit: int = 64 * 1024
     finalize_grace_seconds: float = 0.25
     shutdown_wait_seconds: float = 2.0
-    # Cookies and Web Storage can only be read while the browser lives, so keep
-    # a recent copy on disk for sessions that end with the window being closed.
-    snapshot_interval_seconds: float = 30.0
+    # Cookies and Web Storage are captured from events, so periodic snapshots
+    # are only an optional extra; see chrome_logger/state_capture.py.
+    snapshot_interval_seconds: float = 0.0
+    max_storage_payload_bytes: int = 8 * 1024 * 1024
     writer_queue_size: int = 20_000
     max_interaction_payload_bytes: int = 256 * 1024
     log_level: str = "INFO"
@@ -59,6 +60,8 @@ class CaptureConfig:
             raise ValueError("writer_queue_size is too small")
         if self.max_interaction_payload_bytes < 1024:
             raise ValueError("max_interaction_payload_bytes is too small")
+        if self.max_storage_payload_bytes < self.max_interaction_payload_bytes:
+            raise ValueError("max_storage_payload_bytes cannot be smaller than max_interaction_payload_bytes")
         for name in ("finalize_grace_seconds", "shutdown_wait_seconds"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:

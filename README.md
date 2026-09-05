@@ -20,14 +20,14 @@ Python toolkit for capturing **Chrome application-layer traffic** through the Ch
 - WebSocket frames and SSE messages are streamed to disk rather than accumulated indefinitely in RAM.
 - One canonical source: `network/requests.jsonl`.
 - Normalized timestamps (`epochMs`, local ISO time, and CDP monotonic time when available).
-- Start/end cookie and localStorage/sessionStorage snapshots.
+- Cookies and Web Storage captured from events, not samples: every `DOMStorage` mutation, a cookie-jar diff after each event that can change it, and a full page dump on `pagehide`/`freeze`/`visibilitychange` so closing the browser keeps the final state.
 - Dedicated browser console, exception, log, navigation, and target files.
 - A single interaction script installed in an isolated JavaScript world; safe mode redacts every form-control value and never exports raw `outerHTML`.
 - Sensitive values are redacted by default while retaining their length and a per-session HMAC.
 - Rewritten proxy relay with correct socket lifecycle, IPv6, HTTP(S) upstream support, and live direct/proxy switching on Windows.
 - Fatal CDP/writer failures produce an error manifest and non-zero process exit code instead of a false success.
 - Bounded interaction payloads, pending `ExtraInfo`, proxy connections, and writer queue prevent unbounded memory growth.
-- Modular typed package, 96 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
+- Modular typed package, 115 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
 - Automatic official Stable Chrome for Testing download and caching when no local Chrome is available, without ChromeDriver.
 
 ## Installation
@@ -94,7 +94,7 @@ Important options:
 | `--capture-clipboard` | Capture pasted text; redacted in safe mode |
 | `--no-console` | Disable console, exceptions, and Log-domain files |
 | `--no-storage` | Disable cookie and Web Storage snapshots |
-| `--snapshot-interval 30` | Refresh cookie/storage snapshots every N seconds so a closed browser keeps recent state; `0` disables |
+| `--snapshot-interval 0` | Extra periodic cookie/storage snapshot every N seconds; `0` relies on event capture alone |
 | `--keep-chrome` | Leave Chrome open after disabling Fetch, auto-attach, and injected listeners |
 | `--duration SECONDS` | Stop and finalize automatically; must be finite and non-negative |
 | `--start-url URL` | Initial page; defaults to `about:blank` to avoid unsolicited new-tab traffic |
@@ -117,7 +117,8 @@ session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM/
 ├── realtime/
 ├── interactions/
 ├── browser/                 # includes protocol_capabilities.jsonl
-├── snapshots/
+├── storage/                 # cookie_changes, dom_storage_events, page_flushes
+├── snapshots/               # start/end/attach dumps and rebuilt final state
 └── reports/
     ├── summary.txt
     ├── stats.txt
@@ -192,6 +193,7 @@ chrome_logger/
 ├── network_capture.py     # HTTP, redirects, ExtraInfo, and bodies
 ├── realtime_capture.py    # WebSocket, SSE, and WebTransport
 ├── browser_capture.py     # interactions, console, navigation, snapshots
+├── state_capture.py       # event-sourced cookies and Web Storage
 ├── registry.py            # session/request/hop identity and ExtraInfo ordering
 ├── storage.py             # writer thread, JSONL, bodies, and reports
 ├── redaction.py           # contextual redaction

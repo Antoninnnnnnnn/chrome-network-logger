@@ -109,6 +109,7 @@ class NetworkCaptureMixin:
             for assigned_key in assigned:
                 if assigned_key in self.finalize_deadlines:
                     self._schedule_finalize(assigned_key, reason=self.finalize_deadlines[assigned_key][2], delay=0.05)
+        self.note_response_cookies(session_id, (params.get("response") or {}).get("headers"))
 
     def _response_extra(self, session_id: str | None, params: dict[str, Any]) -> None:
         request_id = params.get("requestId")
@@ -128,6 +129,7 @@ class NetworkCaptureMixin:
             key = self.registry.assign_extra(session_id, str(request_id), "response", payload)
             if key and key in self.finalize_deadlines:
                 self._schedule_finalize(key, reason=self.finalize_deadlines[key][2], delay=0.05)
+        self.note_response_cookies(session_id, payload["headers"])
 
     def _response_early_hints(self, session_id: str | None, params: dict[str, Any]) -> None:
         request_id = params.get("requestId")
