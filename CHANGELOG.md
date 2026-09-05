@@ -9,6 +9,13 @@ All notable changes to Chrome Network Logger are documented here.
 - Stop configuring CDP durable messages. On Chrome 152 that call makes the network service drop retained response bodies, so every `Network.getResponseBody` returned `No data found for resource with given identifier` and no body was captured. A local reproduction went from 0/30 to 30/30 bodies once the call was removed.
 - Add `--durable-messages` for anyone who wants the old behaviour, documented as breaking body retrieval.
 
+### Clean stop
+
+- Print a plain end-of-session summary that says why the capture stopped, that the data was written, how many requests and bodies were kept, and where to start reading. `partial` no longer looks like data loss.
+- Stop printing a `ConnectionResetError` traceback when the browser window is closed; a reset socket is an ordinary end of capture.
+- Handle `SIGBREAK` (Ctrl+Break) and `SIGHUP` like `SIGINT`, so those also finalize instead of killing the process.
+- Verified end to end: Ctrl+C with the browser alive finalizes in ~6s as `complete` with exit code 0 and no traceback; closing the browser finalizes immediately as `partial` with reason `chromeExited`, one warning, and no traceback.
+
 ### IndexedDB and Cache Storage capture
 
 - Capture IndexedDB and Cache Storage, which never appear in network traffic and vanish with the browser. Chrome's `Storage` events say which database, object store, or cache changed, and only that scope is re-dumped.

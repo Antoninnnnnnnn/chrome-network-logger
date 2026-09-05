@@ -134,3 +134,45 @@ def test_no_download_chrome_fails_cleanly_but_still_creates_profile(monkeypatch,
 
     assert error.value.code == 2
     assert profile.is_dir()
+
+
+def test_stop_reasons_are_explained_in_plain_language() -> None:
+    assert cli._human_reason("signal:2") == "you stopped it (Ctrl+C)"
+    assert cli._human_reason("keyboardInterrupt") == "you stopped it (Ctrl+C)"
+    assert cli._human_reason("chromeExited") == "you closed the browser"
+    assert cli._human_reason("cdpDisconnected") == "the browser connection dropped"
+    assert cli._human_reason("durationElapsed") == "the requested duration elapsed"
+    assert cli._human_reason("error:RuntimeError") == "a capture error (RuntimeError)"
+    assert cli._human_reason("somethingNew") == "somethingNew"
+
+
+def test_session_summary_states_that_data_was_saved(capsys, tmp_path: Path) -> None:
+    stats = {
+        "requests": 120,
+        "bodies": 44,
+        "bodyErrors": 0,
+        "cookieChanges": 9,
+        "storageChanges": 3,
+        "storageFlushes": 2,
+        "idbEntries": 12,
+        "cacheEntries": 5,
+    }
+    cli._print_session_summary(tmp_path / "session_x", "partial", "chromeExited", stats)
+    output = capsys.readouterr().out
+    assert "Capture stopped: you closed the browser" in output
+    assert "All captured data was written to disk." in output
+    assert "Requests: 120 | bodies stored: 44 | bodies unavailable: 0" in output
+    assert "IndexedDB records: 12 | Cache Storage entries: 5" in output
+    assert "in flight" not in output
+    assert "reports" in output and "requests.jsonl" in output
+
+
+def test_session_summary_reports_in_flight_requests_and_errors(capsys, tmp_path: Path) -> None:
+    cli._print_session_summary(tmp_path / "session_y", "partial", "signal:2", {"incompleteFlushed": 7})
+    output = capsys.readouterr().out
+    assert "7 request(s) were still in flight" in output
+
+    cli._print_session_summary(tmp_path / "session_z", "error", "error:OSError", None)
+    output = capsys.readouterr().out
+    assert "Some data could not be finalized" in output
+    assert "All captured data was written to disk." not in output

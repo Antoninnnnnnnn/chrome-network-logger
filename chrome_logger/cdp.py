@@ -579,6 +579,11 @@ class CDPCapture(
                     pass
                 except websocket.WebSocketConnectionClosedException:
                     break
+                except OSError as exc:
+                    # Closing the browser resets the socket. That is an ordinary
+                    # end of capture, not a fault worth a traceback.
+                    LOG.debug("CDP connection ended: %s", exc)
+                    break
                 except Exception as exc:
                     if self.running.is_set():
                         LOG.exception("CDP receive loop failed: %s", exc)

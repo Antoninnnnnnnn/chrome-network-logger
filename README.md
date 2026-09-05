@@ -28,7 +28,7 @@ Python toolkit for capturing **Chrome application-layer traffic** through the Ch
 - Rewritten proxy relay with correct socket lifecycle, IPv6, HTTP(S) upstream support, and live direct/proxy switching on Windows.
 - Fatal CDP/writer failures produce an error manifest and non-zero process exit code instead of a false success.
 - Bounded interaction payloads, pending `ExtraInfo`, proxy connections, and writer queue prevent unbounded memory growth.
-- Modular typed package, 133 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
+- Modular typed package, 136 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
 - Automatic official Stable Chrome for Testing download and caching when no local Chrome is available, without ChromeDriver.
 
 ## Installation

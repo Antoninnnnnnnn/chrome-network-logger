@@ -182,6 +182,53 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _human_reason(reason: str) -> str:
+    """Explain in one clause why the capture stopped."""
+    if reason.startswith("signal:"):
+        return "you stopped it (Ctrl+C)"
+    mapping = {
+        "keyboardInterrupt": "you stopped it (Ctrl+C)",
+        "chromeExited": "you closed the browser",
+        "cdpDisconnected": "the browser connection dropped",
+        "durationElapsed": "the requested duration elapsed",
+        "user": "you stopped it",
+    }
+    if reason in mapping:
+        return mapping[reason]
+    if reason.startswith("error:"):
+        return f"a capture error ({reason.split(':', 1)[1]})"
+    return reason
+
+
+def _print_session_summary(base: Path, status: str, reason: str, stats: dict[str, int] | None) -> None:
+    """Say what was saved, in plain language, so nothing looks lost."""
+    stats = stats or {}
+    print(f"\nCapture stopped: {_human_reason(reason)}")
+    if status == "error":
+        print("Some data could not be finalized; see the warnings above and manifest.json.")
+    else:
+        print("All captured data was written to disk.")
+    requests = stats.get("requests", 0)
+    bodies = stats.get("bodies", 0)
+    body_errors = stats.get("bodyErrors", 0)
+    print(f"  Requests: {requests} | bodies stored: {bodies} | bodies unavailable: {body_errors}")
+    state = (
+        f"  Cookie changes: {stats.get('cookieChanges', 0)} | "
+        f"Web Storage changes: {stats.get('storageChanges', 0)} | "
+        f"page flushes: {stats.get('storageFlushes', 0)}"
+    )
+    print(state)
+    if stats.get("idbEntries") or stats.get("cacheEntries"):
+        print(
+            f"  IndexedDB records: {stats.get('idbEntries', 0)} | Cache Storage entries: {stats.get('cacheEntries', 0)}"
+        )
+    in_flight = stats.get("incompleteFlushed", 0)
+    if in_flight:
+        print(f"  {in_flight} request(s) were still in flight and are marked incomplete; everything else is complete.")
+    print(f"  Session: {base}")
+    print(f"  Start here: {base / 'reports' / 'summary.txt'} and {base / 'network' / 'requests.jsonl'}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -308,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         stop_requested.set()
 
     previous_signal_handlers: dict[int, object] = {}
-    for signal_name in ("SIGINT", "SIGTERM"):
+    for signal_name in ("SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"):
         signum = getattr(signal, signal_name, None)
         if signum is not None:
             try:
@@ -442,12 +489,18 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             status = "error"
             LOG.exception("Session finalization failed: %s", exc)
+            safe_warning(f"Session finalization failed with {type(exc).__name__}: {exc}")
         for signum, handler in previous_signal_handlers.items():
             try:
                 signal.signal(signum, handler)
             except (OSError, ValueError):
                 LOG.debug("Could not restore signal handler %s", signum)
-        print(f"Session finalized: {store.base.resolve()} ({status})")
+        _print_session_summary(
+            store.base.resolve(),
+            status,
+            shutdown_reason,
+            capture.stats if capture else None,
+        )
     return exit_code
 
 
