@@ -353,9 +353,7 @@ def main(argv: list[str] | None = None) -> int:
             if not browser_live:
                 # The browser is already gone, so finalize from the event-sourced
                 # state instead of waiting out shutdown timeouts on a dead socket.
-                safe_warning(
-                    "Browser closed before shutdown; writing the state rebuilt from captured events"
-                )
+                safe_warning("Browser closed before shutdown; writing the state rebuilt from captured events")
             if browser_live:
                 try:
                     capture.snapshot("end")

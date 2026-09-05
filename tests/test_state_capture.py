@@ -128,13 +128,17 @@ def test_dom_storage_events_rebuild_the_current_values(tmp_path: Path) -> None:
     capture, store, _ = make_capture(tmp_path)
     capture.targets["s"] = {"targetId": "t", "type": "page", "url": "https://example.test/"}
     storage_id = {"storageKey": "https://example.test/", "isLocalStorage": True}
-    capture._dom_storage_event("s", "DOMStorage.domStorageItemAdded", {"storageId": storage_id, "key": "k", "newValue": "1"})
+    capture._dom_storage_event(
+        "s", "DOMStorage.domStorageItemAdded", {"storageId": storage_id, "key": "k", "newValue": "1"}
+    )
     capture._dom_storage_event(
         "s",
         "DOMStorage.domStorageItemUpdated",
         {"storageId": storage_id, "key": "k", "oldValue": "1", "newValue": "2"},
     )
-    capture._dom_storage_event("s", "DOMStorage.domStorageItemAdded", {"storageId": storage_id, "key": "j", "newValue": "9"})
+    capture._dom_storage_event(
+        "s", "DOMStorage.domStorageItemAdded", {"storageId": storage_id, "key": "j", "newValue": "9"}
+    )
     capture._dom_storage_event("s", "DOMStorage.domStorageItemRemoved", {"storageId": storage_id, "key": "j"})
     key = capture._dom_storage_key("https://example.test", True)
     assert capture._dom_storage[key]["values"] == {"k": "2"}
@@ -168,7 +172,11 @@ def test_attach_dump_seeds_the_mirror_that_events_build_on(tmp_path: Path) -> No
     capture._dom_storage_event(
         "s",
         "DOMStorage.domStorageItemAdded",
-        {"storageId": {"securityOrigin": "https://example.test", "isLocalStorage": True}, "key": "later", "newValue": "1"},
+        {
+            "storageId": {"securityOrigin": "https://example.test", "isLocalStorage": True},
+            "key": "later",
+            "newValue": "1",
+        },
     )
     assert capture._dom_storage[key]["values"] == {"seeded": "yes", "later": "1"}
 
