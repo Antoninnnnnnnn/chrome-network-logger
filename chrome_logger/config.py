@@ -38,6 +38,9 @@ class CaptureConfig:
     # Cookies and Web Storage are captured from events, so periodic snapshots
     # are only an optional extra; see chrome_logger/state_capture.py.
     snapshot_interval_seconds: float = 0.0
+    # Chrome 152 stops retaining response bodies once durable messages are
+    # configured, which breaks body capture entirely.
+    durable_messages: bool = False
     max_storage_payload_bytes: int = 8 * 1024 * 1024
     writer_queue_size: int = 20_000
     max_interaction_payload_bytes: int = 256 * 1024

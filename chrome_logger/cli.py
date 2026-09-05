@@ -129,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extra periodic cookie/storage snapshot every N seconds; 0 relies on event capture alone",
     )
     parser.add_argument(
+        "--durable-messages",
+        action="store_true",
+        help="Configure CDP durable messages; on current Chrome this stops response bodies from being retrievable",
+    )
+    parser.add_argument(
         "--proxy",
         metavar="N|random|none",
         default="none",
@@ -177,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         capture_storage=not args.no_storage,
         compress_text_bodies=not args.no_text_compression,
         snapshot_interval_seconds=args.snapshot_interval,
+        durable_messages=args.durable_messages,
         log_level=args.log_level,
     )
     config.validate()

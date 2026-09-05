@@ -94,6 +94,7 @@ Options importantes :
 | `--capture-clipboard` | Capture les collages ; masqués en mode `safe` |
 | `--no-console` | Désactive console, exceptions et domaine `Log` |
 | `--no-storage` | Désactive snapshots cookies/localStorage/sessionStorage |
+| `--durable-messages` | Active les messages durables CDP ; le Chrome actuel refuse alors de renvoyer les corps de réponse |
 | `--snapshot-interval 0` | Snapshot cookies/storage périodique supplémentaire toutes les N secondes ; `0` s'appuie uniquement sur la capture par événements |
 | `--keep-chrome` | Laisse Chrome ouvert après avoir désactivé Fetch, l'auto-attach et les listeners injectés |
 | `--duration SECONDES` | Arrête et finalise automatiquement ; valeur finie et positive ou nulle |

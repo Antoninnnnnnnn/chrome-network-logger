@@ -273,3 +273,19 @@ def test_cookie_sync_failure_is_recorded_and_releases_the_slot(tmp_path: Path) -
     assert capture._cookie_sync_inflight is False
     assert written(store, "browser/protocol_errors.jsonl")[0]["phase"] == "cookieSync"
     assert not capture.failure.is_set()
+
+
+def test_durable_messages_stay_off_because_they_break_body_capture(tmp_path: Path) -> None:
+    capture, _, socket = make_capture(tmp_path)
+    capture._enable_session("s", {"targetId": "t", "type": "page"})
+    methods = [message["method"] for message in socket.sent]
+    assert "Network.configureDurableMessages" not in methods
+    assert "Network.enable" in methods
+
+
+def test_durable_messages_can_be_opted_into(tmp_path: Path) -> None:
+    capture, _, socket = make_capture(tmp_path)
+    capture.config.durable_messages = True
+    capture._enable_session("s", {"targetId": "t", "type": "page"})
+    configure = next(m for m in socket.sent if m["method"] == "Network.configureDurableMessages")
+    assert configure["params"]["maxTotalBufferSize"] == capture.config.max_total_buffer

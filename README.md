@@ -94,6 +94,7 @@ Important options:
 | `--capture-clipboard` | Capture pasted text; redacted in safe mode |
 | `--no-console` | Disable console, exceptions, and Log-domain files |
 | `--no-storage` | Disable cookie and Web Storage snapshots |
+| `--durable-messages` | Configure CDP durable messages; current Chrome then refuses to return response bodies |
 | `--snapshot-interval 0` | Extra periodic cookie/storage snapshot every N seconds; `0` relies on event capture alone |
 | `--keep-chrome` | Leave Chrome open after disabling Fetch, auto-attach, and injected listeners |
 | `--duration SECONDS` | Stop and finalize automatically; must be finite and non-negative |

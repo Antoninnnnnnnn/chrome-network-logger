@@ -4,6 +4,11 @@ All notable changes to Chrome Network Logger are documented here.
 
 ## 3.1.1 — 2026-09-05
 
+### Fixed — response bodies were never stored
+
+- Stop configuring CDP durable messages. On Chrome 152 that call makes the network service drop retained response bodies, so every `Network.getResponseBody` returned `No data found for resource with given identifier` and no body was captured. A local reproduction went from 0/30 to 30/30 bodies once the call was removed.
+- Add `--durable-messages` for anyone who wants the old behaviour, documented as breaking body retrieval.
+
 ### Event-sourced cookie and Web Storage capture
 
 - Record every `localStorage`/`sessionStorage` mutation from `DOMStorage` events into `storage/dom_storage_events.jsonl`, using the attach-time page dump as the baseline they apply to.

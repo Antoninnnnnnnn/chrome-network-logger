@@ -389,22 +389,25 @@ class CDPCapture(NetworkCaptureMixin, RealtimeCaptureMixin, BrowserCaptureMixin,
             self.targets[session_id] = copy.deepcopy(target_info)
             if target_id:
                 self.target_sessions[target_id] = session_id
-        # Durable-message support is optional. Keep Network.enable itself on
-        # stable parameters so an unsupported experimental flag cannot disable
-        # the entire Network domain on an older Chromium build.
-        self.send(
-            "Network.configureDurableMessages",
-            {
-                "maxTotalBufferSize": self.config.max_total_buffer,
-                "maxResourceBufferSize": self.config.max_resource_buffer,
-            },
-            session_id,
-            PendingCommand(
-                "capability",
-                {"method": "Network.configureDurableMessages", "sessionId": session_id},
-                time.monotonic(),
-            ),
-        )
+        # Durable messages are off by default: on Chrome 152 they make the
+        # network service stop retaining response bodies, so every
+        # Network.getResponseBody answers "No data found for resource with
+        # given identifier" and no body is captured at all. Network.enable
+        # below carries the same buffer sizes on stable parameters.
+        if self.config.durable_messages:
+            self.send(
+                "Network.configureDurableMessages",
+                {
+                    "maxTotalBufferSize": self.config.max_total_buffer,
+                    "maxResourceBufferSize": self.config.max_resource_buffer,
+                },
+                session_id,
+                PendingCommand(
+                    "capability",
+                    {"method": "Network.configureDurableMessages", "sessionId": session_id},
+                    time.monotonic(),
+                ),
+            )
         network_options = {
             "maxTotalBufferSize": self.config.max_total_buffer,
             "maxResourceBufferSize": self.config.max_resource_buffer,
