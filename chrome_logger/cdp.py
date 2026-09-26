@@ -56,6 +56,7 @@ class CDPCapture(
         self.attach_attempts: dict[str, int] = {}
         self.discovered_targets: dict[str, tuple[float, dict[str, Any]]] = {}
         self.enabled_sessions: set[str] = set()
+        self.degraded_sessions: set[str] = set()
         self.finalize_deadlines: dict[str, tuple[float, float, str | None]] = {}
         self.open_websockets: dict[str, dict[str, Any]] = {}
         self.paused_fetches: dict[str, tuple[str | None, str | None]] = {}
@@ -111,6 +112,7 @@ class CDPCapture(
             "cacheEntries": 0,
             "clientStorageErrors": 0,
             "clientStorageSkipped": 0,
+            "degradedSessions": 0,
         }
 
     def _fail_capture(self, message: str, error: BaseException | None = None) -> None:
@@ -166,10 +168,28 @@ class CDPCapture(
             self.stats["detachedSessionCommands"] += 1
             LOG.debug("Ignoring %s failure for detached session %s: %s", method, session_id, error)
             return
+        target = self._target(session_id) if session_id else None
+        if target is not None and target.get("type") != "page":
+            # Workers, service workers and iframes are secondary targets: Chrome
+            # parks idle service workers without answering their setup commands,
+            # and losing one of them must not abort the whole capture.
+            self._degrade_session(str(session_id), target, method, "timed out" if timed_out else error)
+            return
         if timed_out:
             self._fail_capture(f"Required CDP command timed out: {method}", TimeoutError(method))
         else:
             self._fail_capture(f"Required CDP command failed: {method}: {error}", RuntimeError(str(error)))
+
+    def _degrade_session(self, session_id: str, target: dict[str, Any], method: str, error: Any) -> None:
+        with self.state_lock:
+            if session_id in self.degraded_sessions:
+                return
+            self.degraded_sessions.add(session_id)
+        self.stats["degradedSessions"] += 1
+        label = f"{target.get('type')} {(target.get('url') or '')[:100]}".strip()
+        message = f"Partial capture for {label}: {method} {error}"
+        LOG.warning(message)
+        self.store.add_warning(message)
 
     def connect(self) -> bool:
         try:

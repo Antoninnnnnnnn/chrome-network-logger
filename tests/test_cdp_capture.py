@@ -684,3 +684,33 @@ def test_responses_that_cannot_carry_a_body_are_explained(tmp_path: Path) -> Non
         "the request failed before any response arrived (net::ERR_FAILED)"
     )
     assert reason({"request": {}}) == "no response was received for this request"
+
+
+def test_required_command_timeout_on_service_worker_is_not_fatal(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    capture.enabled_sessions.add("sw")
+    capture.targets["sw"] = {"targetId": "t-sw", "type": "service_worker", "url": "https://example.test/sw.js"}
+    for message_id, method in ((1, "Network.enable"), (2, "Runtime.enable")):
+        capture.pending[message_id] = PendingCommand(
+            "required_command",
+            {"method": method, "sessionId": "sw"},
+            time.monotonic() - 60,
+        )
+    capture._process_pending_timeouts()
+    assert not capture.failure.is_set()
+    assert capture.stats["degradedSessions"] == 1
+    assert len(store.warnings) == 1
+    assert "service_worker" in store.warnings[0]
+
+
+def test_required_command_timeout_on_page_stays_fatal(tmp_path: Path) -> None:
+    capture, _ = make_capture(tmp_path)
+    capture.enabled_sessions.add("p")
+    capture.targets["p"] = {"targetId": "t-p", "type": "page", "url": "https://example.test"}
+    capture.pending[1] = PendingCommand(
+        "required_command",
+        {"method": "Network.enable", "sessionId": "p"},
+        time.monotonic() - 60,
+    )
+    capture._process_pending_timeouts()
+    assert capture.failure.is_set()
