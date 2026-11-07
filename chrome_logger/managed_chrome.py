@@ -30,6 +30,9 @@ _MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 _MAX_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 20_000
 _COPY_CHUNK_BYTES = 1024 * 1024
+_PROGRESS_PERCENT_STEP = 10
+_PROGRESS_UNKNOWN_SIZE_STEP_BYTES = 16 * 1024 * 1024
+_MEBIBYTE = 1024 * 1024
 _VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -144,16 +147,43 @@ def _https_response(url: str, *, allowed_host: str, path_prefix: str, timeout: f
         raise ManagedChromeError(f"Could not reach the official Chrome endpoint: {exc}") from exc
 
 
-def _declared_size(response: http.client.HTTPResponse, maximum: int) -> None:
+def _declared_size(response: http.client.HTTPResponse, maximum: int) -> int | None:
     raw_length = response.getheader("Content-Length")
     if raw_length is None:
-        return
+        return None
     try:
         length = int(raw_length)
     except ValueError as exc:
         raise ManagedChromeError("Official Chrome endpoint returned an invalid Content-Length") from exc
     if length < 0 or length > maximum:
         raise ManagedChromeError(f"Chrome download is outside the allowed size limit ({length} bytes)")
+    return length
+
+
+def _download_progress(progress: ProgressCallback | None, total: int | None) -> Callable[[int], None]:
+    """Return a hook reporting download progress at most every 10 %, or every 16 MB without a length."""
+    if progress is None:
+        return lambda _downloaded: None
+    next_mark = _PROGRESS_PERCENT_STEP if total else _PROGRESS_UNKNOWN_SIZE_STEP_BYTES
+
+    def megabytes(size: int) -> str:
+        return f"{size / _MEBIBYTE:.0f}"
+
+    def report(downloaded: int) -> None:
+        nonlocal next_mark
+        if total:
+            percent = min(100, downloaded * 100 // total)
+            if percent < next_mark:
+                return
+            next_mark = (percent // _PROGRESS_PERCENT_STEP + 1) * _PROGRESS_PERCENT_STEP
+            progress(f"Downloading Chrome: {percent}% ({megabytes(downloaded)}/{megabytes(total)} MB)")
+            return
+        if downloaded < next_mark:
+            return
+        next_mark = (downloaded // _PROGRESS_UNKNOWN_SIZE_STEP_BYTES + 1) * _PROGRESS_UNKNOWN_SIZE_STEP_BYTES
+        progress(f"Downloading Chrome: {megabytes(downloaded)} MB")
+
+    return report
 
 
 def _read_https(url: str, *, allowed_host: str, path_prefix: str, maximum: int) -> bytes:
@@ -179,7 +209,13 @@ def _read_https(url: str, *, allowed_host: str, path_prefix: str, maximum: int) 
         connection.close()
 
 
-def _download_https(url: str, destination: Path, *, maximum: int) -> str:
+def _download_https(
+    url: str,
+    destination: Path,
+    *,
+    maximum: int,
+    progress: ProgressCallback | None = None,
+) -> str:
     connection, response = _https_response(
         url,
         allowed_host=_DOWNLOAD_HOST,
@@ -189,7 +225,7 @@ def _download_https(url: str, destination: Path, *, maximum: int) -> str:
     digest = hashlib.sha256()
     downloaded = 0
     try:
-        _declared_size(response, maximum)
+        report = _download_progress(progress, _declared_size(response, maximum))
         with destination.open("wb") as output:
             while chunk := response.read(_COPY_CHUNK_BYTES):
                 downloaded += len(chunk)
@@ -197,6 +233,7 @@ def _download_https(url: str, destination: Path, *, maximum: int) -> str:
                     raise ManagedChromeError("Chrome archive exceeded the allowed size limit")
                 digest.update(chunk)
                 output.write(chunk)
+                report(downloaded)
         if downloaded == 0:
             raise ManagedChromeError("Official Chrome endpoint returned an empty archive")
         return digest.hexdigest()
@@ -437,7 +474,7 @@ def ensure_managed_chrome(
         staging: Path | None = Path(tempfile.mkdtemp(prefix=f".{version}-extract-", dir=platform_root))
         try:
             notify(f"Downloading official Chrome for Testing Stable {version} ({platform_id})")
-            archive_sha256 = _download_https(url, temporary_archive, maximum=_MAX_ARCHIVE_BYTES)
+            archive_sha256 = _download_https(url, temporary_archive, maximum=_MAX_ARCHIVE_BYTES, progress=notify)
             _extract_archive(temporary_archive, staging)
             staged_executable = staging / _relative_executable(platform_id)
             if not staged_executable.is_file() or staged_executable.is_symlink():
