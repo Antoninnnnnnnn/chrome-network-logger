@@ -39,8 +39,8 @@ class ClientStorageMixin:
         if not origin:
             return
         with self.state_lock:
-            known = origin in self._client_storage_origins
-            self._client_storage_origins.add(origin)
+            known = (session_id, origin) in self._client_storage_origins
+            self._client_storage_origins.add((session_id, origin))
         if known:
             return
         for method in ("Storage.trackIndexedDBForOrigin", "Storage.trackCacheStorageForOrigin"):
@@ -171,7 +171,7 @@ class ClientStorageMixin:
             "returnByValue": True,
             "awaitPromise": True,
         }
-        context_id = self._isolated_context(session_id)
+        context_id = self._isolated_context(session_id, origin)
         if context_id is not None:
             params["contextId"] = context_id
         self.send(
@@ -191,11 +191,30 @@ class ClientStorageMixin:
             ),
         )
 
-    def _isolated_context(self, session_id: str) -> int | None:
-        """Prefer the isolated world so the page cannot observe the read."""
+    def _isolated_context(self, session_id: str, origin: str | None = None) -> int | None:
+        """Pick the isolated-world context of the frame that owns `origin`.
+
+        The isolated world keeps the read invisible to the page. A session can
+        hold one such context per same-process iframe, so the context must
+        match the origin being read, preferring the main frame; otherwise the
+        dump would read a child iframe's databases.
+        """
+        wanted = (origin or "").rstrip("/")
         with self.state_lock:
-            contexts = sorted(self.interaction_contexts.get(session_id, set()))
-        return contexts[-1] if contexts else None
+            live = self.interaction_contexts.get(session_id, set())
+            details = self.interaction_context_origins.get(session_id, {})
+            main_frame = (self.targets.get(session_id) or {}).get("targetId")
+            candidates = [
+                (context_id, details.get(context_id) or {})
+                for context_id in sorted(live)
+                if not wanted or (details.get(context_id) or {}).get("origin") == wanted
+            ]
+        if not candidates:
+            return None
+        for context_id, info in reversed(candidates):
+            if main_frame and info.get("frameId") == main_frame:
+                return context_id
+        return candidates[-1][0]
 
     @staticmethod
     def _idb_dump_script(database: str, store: str, limit: int) -> str:
@@ -224,10 +243,23 @@ class ClientStorageMixin:
     }
     return output;
   };
+  // Reading must never change the application's storage: skip databases that
+  // no longer exist instead of letting open() create them, abort any upgrade,
+  // and give way at once if the page needs a version change.
+  try {
+    if (typeof indexedDB.databases === 'function') {
+      const known = await indexedDB.databases();
+      if (!known.some((item) => item && item.name === DATABASE)) return {ok: false, error: 'missing database'};
+    }
+  } catch (_) {}
   let db;
   try {
     db = await new Promise((resolve, reject) => {
       const request = indexedDB.open(DATABASE);
+      request.onupgradeneeded = () => {
+        try { request.transaction.abort(); } catch (_) {}
+        reject(new Error('database does not exist'));
+      };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
       request.onblocked = () => reject(new Error('open blocked'));
@@ -235,6 +267,7 @@ class ClientStorageMixin:
   } catch (error) {
     return {ok: false, error: String(error)};
   }
+  db.onversionchange = () => { try { db.close(); } catch (_) {} };
   try {
     if (!db.objectStoreNames.contains(STORE)) return {ok: false, error: 'missing object store'};
     const objectStore = db.transaction(STORE, 'readonly').objectStore(STORE);

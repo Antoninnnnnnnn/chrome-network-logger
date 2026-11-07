@@ -53,6 +53,10 @@ class CaptureConfig:
     durable_messages: bool = False
     max_storage_payload_bytes: int = 8 * 1024 * 1024
     writer_queue_size: int = 20_000
+    # Bodies can be large, so the writer queue is also bounded in bytes.
+    writer_queue_max_bytes: int = 256 * 1024 * 1024
+    max_manifest_warnings: int = 200
+    export_har: bool = True
     max_interaction_payload_bytes: int = 256 * 1024
     log_level: str = "INFO"
 
@@ -73,6 +77,10 @@ class CaptureConfig:
             raise ValueError("max_resource_buffer cannot exceed max_total_buffer")
         if self.writer_queue_size < 100:
             raise ValueError("writer_queue_size is too small")
+        if self.writer_queue_max_bytes < 1024 * 1024:
+            raise ValueError("writer_queue_max_bytes must be at least 1 MiB")
+        if self.max_manifest_warnings < 1:
+            raise ValueError("max_manifest_warnings must be >= 1")
         for name in ("max_idb_entries", "max_cache_entries"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"{name} must be >= 1")

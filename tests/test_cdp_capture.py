@@ -473,17 +473,12 @@ def test_browser_storage_snapshot_lifecycle(tmp_path: Path) -> None:
 
     capture.send = pending_send  # type: ignore[method-assign]
     capture.snapshot("start")
-    assert capture._snapshot_pending == 2
-    commands = {command.kind: message_id for message_id, command in capture.pending.items()}
-    capture._handle_command_response(
-        {"id": commands["snapshot_cookies"], "result": {"cookies": [{"name": "sid", "value": "secret"}]}}
-    )
-    capture._handle_command_response(
-        {
-            "id": commands["snapshot_storage"],
-            "result": {"result": {"value": {"localStorage": {"ok": True, "values": {"token": "secret"}}}}},
-        }
-    )
+    assert capture._snapshot_pending == 3
+    cookies_id = next(mid for mid, command in capture.pending.items() if command.kind == "snapshot_cookies")
+    storage_ids = [mid for mid, command in capture.pending.items() if command.kind == "snapshot_storage"]
+    capture._handle_command_response({"id": cookies_id, "result": {"cookies": [{"name": "sid", "value": "secret"}]}})
+    for message_id in storage_ids:
+        capture._handle_command_response({"id": message_id, "result": {"entries": [["token", "secret"]]}})
     assert capture.wait_for_snapshots(0.01) is True
     assert any(path == "snapshots/cookies_start.json" for path, _ in store.writes)
     assert any(path == "snapshots/storage_start.jsonl" for path, _ in store.writes)
@@ -646,8 +641,9 @@ def test_snapshot_targets_page_sessions(tmp_path: Path) -> None:
     capture.targets["w"] = {"targetId": "target-2", "type": "worker", "url": "https://example.test/w.js"}
     capture.snapshot("interval")
     assert ("Storage.getCookies", None) in sent
-    assert ("Runtime.evaluate", "s") in sent
-    assert ("Runtime.evaluate", "w") not in sent
+    assert sent.count(("DOMStorage.getDOMStorageItems", "s")) == 2
+    assert ("DOMStorage.getDOMStorageItems", "w") not in sent
+    assert not any(method == "Runtime.evaluate" for method, _ in sent)
 
 
 def test_body_failure_on_a_cancelled_request_is_not_counted_as_a_lost_body(tmp_path: Path) -> None:

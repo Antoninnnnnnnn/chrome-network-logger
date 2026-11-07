@@ -28,6 +28,7 @@ from .redaction import Redactor
 from .storage import CaptureStore
 
 LOG = logging.getLogger(__name__)
+_LONG_WINDOWS_PROFILE_PATH = 120
 
 
 def _safe_group_name(value: str) -> str:
@@ -43,12 +44,31 @@ def _output_parent(argument: str | None, non_interactive: bool) -> Path:
         return path
     if non_interactive:
         return Path.cwd()
-    raw = input("Capture group/subfolder (empty = current directory): ").strip()
+    raw = _prompt("Capture group/subfolder (empty = current directory): ").strip()
     if not raw:
         return Path.cwd()
     path = Path.cwd() / _safe_group_name(raw)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _prompt(message: str) -> str:
+    """Ask a question; a closed stdin (pipe, service, CI) answers with an empty line."""
+    try:
+        return input(message)
+    except EOFError:
+        print()
+        return ""
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
 
 
 def _non_negative_finite_float(value: str) -> float:
@@ -138,17 +158,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-idb-entries",
-        type=int,
+        type=_positive_int,
         default=500,
         help="Maximum IndexedDB records dumped per object store, per dump",
     )
     parser.add_argument(
         "--max-cache-entries",
-        type=int,
+        type=_positive_int,
         default=200,
         help="Maximum Cache Storage entries dumped per cache, per dump",
     )
     parser.add_argument("--no-text-compression", action="store_true", help="Do not gzip textual bodies")
+    parser.add_argument("--no-har", action="store_true", help="Do not write reports/session.har at the end")
     parser.add_argument(
         "--snapshot-interval",
         type=_non_negative_finite_float,
@@ -185,10 +206,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _signal_name(value: str) -> str:
+    try:
+        return signal.Signals(int(value)).name
+    except (ValueError, TypeError):
+        return value
+
+
 def _human_reason(reason: str) -> str:
     """Explain in one clause why the capture stopped."""
     if reason.startswith("signal:"):
-        return "you stopped it (Ctrl+C)"
+        name = _signal_name(reason.split(":", 1)[1])
+        if name == "SIGINT":
+            return "you stopped it (Ctrl+C)"
+        if name == "SIGBREAK":
+            return "you stopped it (Ctrl+Break)"
+        return f"it received {name}"
     mapping = {
         "keyboardInterrupt": "you stopped it (Ctrl+C)",
         "chromeExited": "you closed the browser",
@@ -231,8 +264,12 @@ def _print_session_summary(base: Path, status: str, reason: str, stats: dict[str
     in_flight = stats.get("incompleteFlushed", 0)
     if in_flight:
         print(f"  {in_flight} request(s) were still in flight and are marked incomplete; everything else is complete.")
+    cut_off = stats.get("incompleteDetached", 0)
+    if cut_off:
+        print(f"  {cut_off} request(s) were cut off because their tab, iframe or worker closed (normal browsing).")
     print(f"  Session: {base}")
-    print(f"  Start here: {base / 'reports' / 'summary.txt'} and {base / 'network' / 'requests.jsonl'}")
+    print(f"  Start here: {base / 'INDEX.md'}")
+    print(f"  Then: {base / 'reports' / 'summary.txt'} and {base / 'network' / 'requests.jsonl'}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -264,9 +301,13 @@ def main(argv: list[str] | None = None) -> int:
         compress_text_bodies=not args.no_text_compression,
         snapshot_interval_seconds=args.snapshot_interval,
         durable_messages=args.durable_messages,
+        export_har=not args.no_har,
         log_level=args.log_level,
     )
-    config.validate()
+    try:
+        config.validate()
+    except ValueError as exc:
+        parser.error(str(exc))
 
     first_run = not (profile_dir / "Default").exists()
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -304,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     if first_run and not args.non_interactive:
         print("\nFirst run: Chrome will use a new isolated profile.")
         print("Log in only to applications you are authorized to inspect.")
-        input("Press Enter to launch Chrome and start capture...")
+        _prompt("Press Enter to launch Chrome and start capture...")
 
     proxies = load_proxies(Path(args.proxy_file).expanduser())
     try:
@@ -312,9 +353,11 @@ def main(argv: list[str] | None = None) -> int:
         proxy_args, relay = build_proxy_route(proxy, verify_tls=not args.proxy_insecure_tls)
     except ValueError as exc:
         parser.error(str(exc))
-        return
     if args.keep_chrome and relay:
-        parser.error("--keep-chrome cannot be used with an HTTP(S) relay because the relay stops with the logger")
+        parser.error(
+            "--keep-chrome cannot be used with a proxy relay (HTTP(S) or authenticated SOCKS5) "
+            "because the relay stops with the logger"
+        )
 
     redactor = Redactor(config.sensitive_mode)
     store = CaptureStore(config, redactor)
@@ -337,6 +380,17 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             LOG.exception("Could not persist warning: %s", message)
 
+    if sys.platform == "win32" and len(str(profile_dir)) > _LONG_WINDOWS_PROFILE_PATH:
+        # Chrome nests Cache Storage and IndexedDB files ~120 characters deep
+        # in the profile; past Windows' 260-character limit, pages then fail
+        # with "UnknownError: Unexpected internal error".
+        message = (
+            f"The profile path is {len(str(profile_dir))} characters long; on Windows, sites may fail to use "
+            "Cache Storage or IndexedDB under long paths. Use a shorter --profile-dir."
+        )
+        LOG.warning(message)
+        safe_warning(message)
+
     if proxy:
         store.set_manifest(proxy={"enabled": True, "upstream": proxy.label(), "relay": bool(relay)})
         LOG.info("Proxy route enabled: %s", proxy.label())
@@ -348,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     capture = None
     capture_connected = False
     keyboard_stop = threading.Event()
+    keyboard_thread: threading.Thread | None = None
     stop_requested = threading.Event()
     shutdown_reason = "user"
     exit_code = 0
@@ -374,7 +429,9 @@ def main(argv: list[str] | None = None) -> int:
         # Port 0 makes Chrome expose navigator.webdriver=true. Resolve a
         # non-zero loopback port immediately before launch instead.
         port = choose_loopback_debugging_port()
-        chrome = launch_chrome(chrome_path, profile_dir, port, [*proxy_args, args.start_url])
+        # Always launch on about:blank: a URL on the command line starts loading
+        # before CDP is attached, and its first requests would be lost.
+        chrome = launch_chrome(chrome_path, profile_dir, port, [*proxy_args, "about:blank"])
         version = wait_for_cdp(chrome)
         port = chrome.port
         LOG.info("Connected to %s", version.get("Browser"))
@@ -396,9 +453,15 @@ def main(argv: list[str] | None = None) -> int:
                     redact=True,
                 )
 
-            start_toggle_keyboard(relay, keyboard_stop, on_toggle=on_toggle)
-            print("[P] toggles the upstream proxy on Windows; active connections are reset.")
+            keyboard_thread = start_toggle_keyboard(relay, keyboard_stop, on_toggle=on_toggle)
+            if keyboard_thread is not None:
+                print("[P] toggles the upstream proxy; active connections are reset.")
 
+        if args.start_url != "about:blank":
+            if capture.open_start_url(args.start_url):
+                LOG.info("Opened the start URL after the first tab was instrumented")
+            else:
+                safe_warning("The start URL was opened before the first tab was fully instrumented")
         time.sleep(0.5)
         capture.snapshot("start")
         capture.wait_for_snapshots(config.shutdown_wait_seconds)
@@ -436,6 +499,9 @@ def main(argv: list[str] | None = None) -> int:
         safe_warning(f"Capture terminated with {type(exc).__name__}: {exc}")
     finally:
         keyboard_stop.set()
+        if keyboard_thread is not None:
+            # Lets the toggle thread restore the terminal mode before exit.
+            keyboard_thread.join(timeout=1)
         if capture and capture_connected:
             browser_live = capture.is_live() and not (chrome and chrome.process.poll() is not None)
             if not browser_live:

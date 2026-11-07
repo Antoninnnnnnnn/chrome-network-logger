@@ -28,7 +28,7 @@ Python toolkit for capturing **Chrome application-layer traffic** through the Ch
 - Rewritten proxy relay with correct socket lifecycle, IPv6, HTTP(S) upstream support, and live direct/proxy switching on Windows.
 - Fatal CDP/writer failures produce an error manifest and non-zero process exit code instead of a false success.
 - Bounded interaction payloads, pending `ExtraInfo`, proxy connections, and writer queue prevent unbounded memory growth.
-- Modular typed package, 136 tests, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
+- Modular typed package, an extensive test suite, coverage enforcement, package validation, Dependabot, CodeQL, and Windows/Linux/macOS CI on Python 3.10–3.14.
 - Automatic official Stable Chrome for Testing download and caching when no local Chrome is available, without ChromeDriver.
 
 ## Installation
@@ -57,7 +57,7 @@ Requires Python 3.10+. An installed Chrome/Chromium is preferred; otherwise the 
 python chrome_network_logger.py
 ```
 
-On first run, a persistent isolated profile is created at `./capture_profile`. Your normal Chrome profile is not used. If Chrome is missing, the official Stable browser is downloaded once into the user cache (`%LOCALAPPDATA%\chrome-network-logger` on Windows) and can then be reused offline. ChromeDriver, Selenium, and Playwright are not installed.
+On first run, a persistent isolated profile is created at `./capture_profile`. Your normal Chrome profile is not used. On Windows keep `--profile-dir` short (under ~120 characters): Chrome nests storage files deep inside the profile, and past the 260-character path limit sites cannot use Cache Storage or IndexedDB. If Chrome is missing, the official Stable browser is downloaded once into the user cache (`%LOCALAPPDATA%\chrome-network-logger` on Windows) and can then be reused offline. ChromeDriver, Selenium, and Playwright are not installed.
 
 This is a genuine visible Chrome process launched without headless mode, WebDriver, or `--enable-automation`, and with a non-zero loopback CDP port so Chrome does not force `navigator.webdriver=true`. That avoids Selenium/Playwright-specific markers, but it **does not guarantee invisibility**: a website may still infer a fresh profile, CDP instrumentation, extensions, network traits, or other environmental signals.
 
@@ -100,10 +100,12 @@ Important options:
 | `--max-cache-entries 200` | Maximum Cache Storage entries dumped per cache, per dump |
 | `--intercept-bodies api` | Resource types whose body is taken while the response is paused, which keeps bodies for targets that close mid-request |
 | `--durable-messages` | Configure CDP durable messages; current Chrome then refuses to return response bodies |
+| `--no-text-compression` | Store text bodies as plain files instead of `.gz` (easier for tools that cannot gunzip) |
+| `--no-har` | Do not write `reports/session.har` |
 | `--snapshot-interval 0` | Extra periodic cookie/storage snapshot every N seconds; `0` relies on event capture alone |
 | `--keep-chrome` | Leave Chrome open after disabling Fetch, auto-attach, and injected listeners |
 | `--duration SECONDS` | Stop and finalize automatically; must be finite and non-negative |
-| `--start-url URL` | Initial page; defaults to `about:blank` to avoid unsolicited new-tab traffic |
+| `--start-url URL` | Initial page, opened only once the first tab is instrumented so its first requests are captured; defaults to `about:blank` |
 | `--proxy N\|random\|none` | Use an explicitly selected proxy; `none`/direct is the default |
 | `--chrome-path PATH` | Explicit Chrome/Chromium executable |
 | `--managed-chrome-dir PATH` | Cache location for the official managed Stable browser |
@@ -115,7 +117,8 @@ Important options:
 
 ```text
 session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM/
-├── manifest.json
+├── INDEX.md                 # start here: outcome, file guide, how to read bodies
+├── manifest.json            # includes a `files` inventory with sizes and record counts
 ├── timeline.jsonl
 ├── network/
 │   ├── requests.jsonl
@@ -129,8 +132,11 @@ session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM/
     ├── summary.txt
     ├── stats.txt
     ├── requests.csv
+    ├── session.har          # HAR 1.2 view, bodies inlined up to 1 MiB
     └── interactions.html
 ```
+
+`INDEX.md` is written when the capture ends. It states the outcome and why the capture stopped, the key numbers, every file with its size and record count, how to open compressed bodies, and the caveats that apply. It is meant as the entry point for whoever analyses the session, including an automated or AI agent that has never seen the format.
 
 `network/requests.jsonl` is canonical. The `isApi` field provides filtering without maintaining duplicate `full` and `filtered` bodies.
 
@@ -174,7 +180,7 @@ python chrome_network_logger.py --proxy none
 python chrome_network_logger.py --proxy-prompt
 ```
 
-HTTP(S) upstreams use a loopback relay that injects proxy authentication and supports **P** to switch between the upstream and direct routing on Windows. Active sockets are closed during a switch. Unauthenticated SOCKS proxies are passed directly to Chrome; authenticated SOCKS is rejected clearly rather than pretending to support it. HTTPS upstream certificate verification is enabled unless `--proxy-insecure-tls` is explicitly used.
+HTTP(S) upstreams and authenticated SOCKS5 upstreams use a loopback relay that injects the credentials, so Chrome never shows an authentication prompt. Through SOCKS5 the relay sends host names to the proxy, so DNS resolves on the proxy side. Press **P** to switch between the upstream and direct routing (Windows, and Linux/macOS when the logger runs in an interactive terminal); active sockets are closed during a switch. Unauthenticated SOCKS4/SOCKS5 proxies are passed directly to Chrome, and authenticated SOCKS4 is rejected clearly. HTTPS upstream certificate verification is enabled unless `--proxy-insecure-tls` is explicitly used.
 
 Merely having a `proxy.txt` file never enables a proxy: routing remains direct until `--proxy`, `--proxy-prompt`, or another explicit selector is used. The relay also limits concurrent connections and returns `503` when saturated.
 
@@ -185,7 +191,7 @@ Merely having a `proxy.txt` file never enables a proxy: routing remains direct u
 - Very large or streaming responses may exceed CDP buffers or the configured body limit.
 - Redirect response bodies are not exposed by `Fetch.getResponseBody`; redirect metadata and headers are still retained per hop.
 - Raw packet traffic and WebRTC media/DataChannel data remain out of scope.
-- Fetch interception is limited to response-stage `Document` requests instead of pausing every browser request.
+- Fetch interception pauses only response-stage `Document`, `XHR` and `Fetch` requests by default (`--intercept-bodies`), and never streamed responses or bodies above the per-body limit.
 - Optional experimental capabilities are recorded in `browser/protocol_capabilities.jsonl`. Failure or timeout of a required domain (`Network`, `Runtime`, `Page`, `Fetch`, or target auto-attach) marks the capture unhealthy and returns a non-zero exit code.
 
 Official references: [Network](https://chromedevtools.github.io/devtools-protocol/tot/Network/), [Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/), and [Fetch](https://chromedevtools.github.io/devtools-protocol/tot/Fetch/).
@@ -201,10 +207,13 @@ chrome_logger/
 ├── browser_capture.py     # interactions, console, navigation, snapshots
 ├── state_capture.py       # event-sourced cookies and Web Storage
 ├── client_storage.py      # IndexedDB and Cache Storage dumps
+├── har.py                 # HAR 1.2 export of the canonical stream
+├── session_index.py       # INDEX.md entry point for readers and agents
+├── fileio.py              # atomic replace with Windows sharing-violation retries
 ├── registry.py            # session/request/hop identity and ExtraInfo ordering
 ├── storage.py             # writer thread, JSONL, bodies, and reports
 ├── redaction.py           # contextual redaction
-├── proxy.py               # parsing and HTTP(S) relay
+├── proxy.py               # parsing, HTTP(S)/SOCKS5 relay and live toggle
 ├── managed_chrome.py      # official download/cache and safe extraction
 └── chrome.py              # dedicated-profile launch and cleanup
 ```

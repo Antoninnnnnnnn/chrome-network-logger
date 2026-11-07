@@ -147,13 +147,26 @@ class StateCaptureMixin:
     # ------------------------------------------------------------- web storage
 
     @staticmethod
-    def _dom_storage_key(origin: str, is_local: bool) -> str:
-        return json.dumps([str(origin or "").rstrip("/"), bool(is_local)])
+    def _dom_storage_key(origin: str, is_local: bool, session_id: str | None = None) -> str:
+        # localStorage is shared by every page of an origin; sessionStorage
+        # belongs to one tab, so two tabs on the same origin stay separate.
+        parts: list[Any] = [str(origin or "").rstrip("/"), bool(is_local)]
+        if not is_local and session_id:
+            parts.append(str(session_id))
+        return json.dumps(parts)
 
-    def _dom_storage_mirror(self, key: str, storage_id: dict[str, Any], source: str) -> dict[str, Any]:
+    def _dom_storage_mirror(
+        self,
+        key: str,
+        storage_id: dict[str, Any],
+        source: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         mirror = self._dom_storage.get(key)
         if mirror is None:
             mirror = {"storageId": storage_id, "values": {}, "sources": []}
+            if session_id and not storage_id.get("isLocalStorage"):
+                mirror["sessionId"] = session_id
             self._dom_storage[key] = mirror
         if source not in mirror["sources"]:
             mirror["sources"].append(source)
@@ -166,10 +179,10 @@ class StateCaptureMixin:
         storage_id = copy.deepcopy(params.get("storageId") or {})
         origin = storage_id.get("storageKey") or storage_id.get("securityOrigin") or ""
         is_local = bool(storage_id.get("isLocalStorage"))
-        key = self._dom_storage_key(str(origin), is_local)
+        key = self._dom_storage_key(str(origin), is_local, session_id)
         item_key = params.get("key")
         with self.state_lock:
-            mirror = self._dom_storage_mirror(key, storage_id, "events")
+            mirror = self._dom_storage_mirror(key, storage_id, "events", session_id)
             values = mirror["values"]
             if change == "cleared":
                 values.clear()
@@ -194,8 +207,19 @@ class StateCaptureMixin:
             redact=True,
         )
 
-    def seed_dom_storage(self, origin: str, dump: dict[str, Any] | None, source: str) -> None:
-        """Apply a full page dump as the baseline the events build on."""
+    def seed_dom_storage(
+        self,
+        origin: str,
+        dump: dict[str, Any] | None,
+        source: str,
+        session_id: str | None = None,
+    ) -> None:
+        """Apply a full page dump as the baseline the events build on.
+
+        A dump is the complete content of the area at read time, so it replaces
+        the mirror: merging would keep keys that were deleted while no event
+        was observed.
+        """
         if not isinstance(dump, dict):
             return
         for field, is_local in (("localStorage", True), ("sessionStorage", False)):
@@ -205,20 +229,21 @@ class StateCaptureMixin:
             values = section.get("values")
             if not isinstance(values, dict):
                 continue
-            key = self._dom_storage_key(origin, is_local)
+            key = self._dom_storage_key(origin, is_local, session_id)
             storage_id = {"securityOrigin": origin, "isLocalStorage": is_local}
             with self.state_lock:
-                mirror = self._dom_storage_mirror(key, storage_id, source)
-                mirror["values"].update({str(name): value for name, value in values.items()})
+                mirror = self._dom_storage_mirror(key, storage_id, source, session_id)
+                mirror["values"] = {str(name): value for name, value in values.items()}
 
     def _storage_flush(self, session_id: str | None, params: dict[str, Any], payload: dict[str, Any]) -> None:
         """Store the dump the injected script sends when a page is going away."""
         payload_size = len(str(params.get("payload") or "").encode("utf-8", errors="replace"))
         if payload_size > self.config.max_storage_payload_bytes:
             self.stats["droppedStorageFlushes"] += 1
+            # One stable message: the count lives in stats.droppedStorageFlushes.
             self.store.add_warning(
-                f"Dropped an oversized storage flush ({payload_size} bytes; "
-                f"limit {self.config.max_storage_payload_bytes})"
+                "Dropped oversized page storage flushes "
+                f"(limit {self.config.max_storage_payload_bytes} bytes; see stats.droppedStorageFlushes)"
             )
             return
         context_id = params.get("executionContextId")
@@ -230,7 +255,7 @@ class StateCaptureMixin:
                 return
         origin = str(payload.get("origin") or "")
         trigger = str(payload.get("trigger") or "unknown")
-        self.seed_dom_storage(origin, payload, f"flush:{trigger}")
+        self.seed_dom_storage(origin, payload, f"flush:{trigger}", session_id)
         self.stats["storageFlushes"] += 1
         self.store.write_jsonl(
             "storage/page_flushes.jsonl",
@@ -260,14 +285,15 @@ class StateCaptureMixin:
             cookies = [copy.deepcopy(cookie) for cookie in self._cookie_state.values()]
             origins = []
             for key, mirror in self._dom_storage.items():
-                origins.append(
-                    {
-                        "key": json.loads(key),
-                        "storageId": copy.deepcopy(mirror["storageId"]),
-                        "sources": list(mirror["sources"]),
-                        "values": dict(mirror["values"]),
-                    }
-                )
+                record = {
+                    "key": json.loads(key),
+                    "storageId": copy.deepcopy(mirror["storageId"]),
+                    "sources": list(mirror["sources"]),
+                    "values": dict(mirror["values"]),
+                }
+                if mirror.get("sessionId"):
+                    record["sessionId"] = mirror["sessionId"]
+                origins.append(record)
         self.store.write_json(
             "snapshots/cookies_final.json",
             {

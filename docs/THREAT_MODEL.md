@@ -15,14 +15,16 @@ Web pages, response bodies, CDP events, proxy servers, captured text, Chrome for
 
 ## Mitigations
 
-- `safe` is the default; `raw` requires an explicit option and prints a warning.
+- `raw` is the default so captures stay usable for debugging; every raw session prints a warning that the directory holds credentials in clear text, and `--sensitive safe` redacts them.
 - Interaction capture runs in an isolated world and redacts every form-control/form value plus element markup before crossing the binding.
 - Context-aware redaction covers headers, cookies, URLs, structured bodies, storage, HTML attributes, console data, and reports.
 - A per-session HMAC supports equality checks without storing its key.
 - Writer tasks, interaction payloads, pending protocol metadata, proxy connections, individual bodies, and total session body storage are bounded.
 - Reports escape HTML, neutralize CSV formulas, and never execute captured markup.
 - Required CDP command, writer, or shutdown failures cause an error/partial manifest and, for fatal failures, a non-zero exit code.
-- Chrome uses a dedicated profile; stale locks are removed only after confirming no Chrome process still references it.
+- Chrome uses a dedicated profile; stale locks are removed only after confirming no Chrome process still references it. Processes are matched on the exact `--user-data-dir` path, never on a substring, so another profile's browser is never stopped.
+- Chrome is closed with the DevTools `Browser.close` command so it flushes its profile; signals and a hard kill are only fallbacks.
+- Web Storage snapshots are read through CDP (`DOMStorage.getDOMStorageItems`) and IndexedDB dumps run in the isolated world of the matching origin, so the page cannot observe them; IndexedDB reads never create, upgrade or block a database.
 - A non-zero ephemeral loopback CDP port avoids Chrome's port-0 `navigator.webdriver` marker; the returned browser endpoint must still match that exact loopback port.
 - The managed fallback accepts only Google's fixed HTTPS metadata/storage hosts and exact Stable archive layout, requires TLS 1.2+, bounds compressed and expanded data, rejects unsafe ZIP paths/types, and publishes an extracted version atomically.
 - Managed download details plus locally computed archive/executable SHA-256 values are recorded, and the executable is rechecked before reuse; automatic download can be disabled with `--no-download-chrome`.

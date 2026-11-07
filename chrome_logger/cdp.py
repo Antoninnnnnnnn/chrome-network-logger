@@ -13,7 +13,7 @@ import websocket
 
 from .browser_capture import BrowserCaptureMixin
 from .chrome import fetch_json
-from .client_storage import ClientStorageMixin
+from .client_storage import ClientStorageMixin, storage_origin
 from .config import CaptureConfig
 from .constants import PAGE_TYPES, SESSION_GONE_CODES, SESSION_GONE_MARKERS, TARGET_TYPES
 from .models import PendingCommand
@@ -68,6 +68,9 @@ class CDPCapture(
         self.world_name = "__cnl_world_" + secrets.token_hex(8)
         self.interaction_script_ids: dict[str, str] = {}
         self.interaction_contexts: dict[str, set[int]] = {}
+        # Origin and frame of each isolated-world context, so storage reads run
+        # in the frame whose origin they target rather than in a child iframe.
+        self.interaction_context_origins: dict[str, dict[int, dict[str, Any]]] = {}
         self._snapshot_condition = threading.Condition(self.state_lock)
         self._quiesce_condition = threading.Condition(self.state_lock)
         self._quiesce_pending = 0
@@ -81,7 +84,16 @@ class CDPCapture(
         self._cookie_baseline_written = False
         self._dom_storage: dict[str, dict[str, Any]] = {}
         # IndexedDB and Cache Storage dumps, keyed by the scope that changed.
-        self._client_storage_origins: set[str] = set()
+        # Storage.track* registrations live on the session that sent them, so
+        # they are tracked per (session, origin) and dropped when it detaches.
+        self._client_storage_origins: set[tuple[str, str]] = set()
+        # DOMStorage snapshot reads in flight, grouped per page so one record
+        # carries both localStorage and sessionStorage.
+        self._storage_snapshot_groups: dict[int, dict[str, Any]] = {}
+        self._storage_snapshot_group_id = 0
+        # (sessionId, method) of setup commands Chrome has answered, used to
+        # open the start URL only once its tab is fully instrumented.
+        self._setup_acks: set[tuple[str, str]] = set()
         self._client_storage_requests: dict[tuple[str, str, str | None, str | None, str | None], str] = {}
         self._client_storage_earliest = 0.0
         self.stats = {
@@ -101,6 +113,7 @@ class CDPCapture(
             "protocolErrors": 0,
             "droppedExtraInfo": 0,
             "incompleteFlushed": 0,
+            "incompleteDetached": 0,
             "detachedSessionCommands": 0,
             "cookieSyncs": 0,
             "cookieChanges": 0,
@@ -605,15 +618,42 @@ class CDPCapture(
                     break
                 except Exception as exc:
                     if self.running.is_set():
-                        LOG.exception("CDP receive loop failed: %s", exc)
-                self._process_pending_timeouts()
-                self._process_target_fallbacks()
-                self._process_finalize_deadlines()
-                self._process_cookie_sync()
-                self._process_client_storage()
+                        self._record_handler_error("CDP receive loop", exc)
+                self._run_periodic_tasks()
+        except Exception as exc:
+            # Never let the reader die silently: a dead reader would otherwise
+            # look like an ordinary browser disconnect.
+            LOG.exception("CDP reader stopped unexpectedly")
+            self._fail_capture(f"CDP reader stopped unexpectedly: {type(exc).__name__}: {exc}", exc)
         finally:
             if self.running.is_set():
                 self.connection_closed.set()
+
+    def _run_periodic_tasks(self) -> None:
+        """Run the reader's housekeeping; one failing task must not stop the others."""
+        for task in (
+            self._process_pending_timeouts,
+            self._process_target_fallbacks,
+            self._process_finalize_deadlines,
+            self._process_cookie_sync,
+            self._process_client_storage,
+        ):
+            try:
+                task()
+            except Exception as exc:
+                self._record_handler_error(task.__name__, exc)
+
+    def _record_handler_error(self, where: str, exc: BaseException) -> None:
+        """Count a handler failure and turn persistent or storage failures into a fatal error."""
+        self.stats["eventErrors"] += 1
+        LOG.exception("CDP handler failed in %s", where)
+        try:
+            self.store.check_health()
+        except Exception as store_exc:
+            self._fail_capture("Capture storage failed while handling a CDP event", store_exc)
+            return
+        if self.stats["eventErrors"] >= 25:
+            self._fail_capture("Too many CDP event handler errors", exc)
 
     def handle(self, message: dict[str, Any]) -> None:
         if "id" in message:
@@ -697,16 +737,23 @@ class CDPCapture(
             elif method == "Runtime.executionContextCreated":
                 context = params.get("context") or {}
                 if context.get("name") == self.world_name and context.get("id") is not None:
+                    aux = context.get("auxData") or {}
                     with self.state_lock:
                         self.interaction_contexts.setdefault(session_id or "", set()).add(int(context["id"]))
+                        self.interaction_context_origins.setdefault(session_id or "", {})[int(context["id"])] = {
+                            "origin": str(context.get("origin") or "").rstrip("/"),
+                            "frameId": aux.get("frameId"),
+                        }
             elif method == "Runtime.executionContextDestroyed":
                 context_id = params.get("executionContextId")
                 if context_id is not None:
                     with self.state_lock:
                         self.interaction_contexts.setdefault(session_id or "", set()).discard(int(context_id))
+                        self.interaction_context_origins.get(session_id or "", {}).pop(int(context_id), None)
             elif method == "Runtime.executionContextsCleared":
                 with self.state_lock:
                     self.interaction_contexts.pop(session_id or "", None)
+                    self.interaction_context_origins.pop(session_id or "", None)
             elif method == "Runtime.bindingCalled" and params.get("name") == self.binding_name:
                 self._binding_message(session_id, params)
             elif method and method.startswith("DOMStorage.") and self.config.capture_storage:
@@ -724,14 +771,7 @@ class CDPCapture(
             elif method in {"Page.frameStartedLoading", "Page.frameStoppedLoading"}:
                 self._navigation_event(session_id, method.rsplit(".", 1)[-1], params)
         except Exception as exc:
-            self.stats["eventErrors"] += 1
-            LOG.exception("Failed to handle CDP event %s", method)
-            try:
-                self.store.check_health()
-            except Exception as store_exc:
-                self._fail_capture("Capture storage failed while handling a CDP event", store_exc)
-            if self.stats["eventErrors"] >= 25:
-                self._fail_capture("Too many CDP event handler errors", exc)
+            self._record_handler_error(f"event {method}", exc)
 
     def _handle_command_response(self, message: dict[str, Any]) -> None:
         message_id = int(message["id"])
@@ -777,6 +817,8 @@ class CDPCapture(
                 )
             return
         if kind == "required_command":
+            with self.state_lock:
+                self._setup_acks.add((str(data.get("sessionId") or ""), str(data.get("method") or "")))
             if error:
                 self._handle_required_failure(data, error)
             return
@@ -787,6 +829,8 @@ class CDPCapture(
             return
         if kind == "interaction_script":
             session_id = str(data.get("sessionId") or "")
+            with self.state_lock:
+                self._setup_acks.add((session_id, "Page.addScriptToEvaluateOnNewDocument"))
             identifier = result.get("identifier")
             if error or not identifier:
                 self.store.write_jsonl(
@@ -1035,23 +1079,32 @@ class CDPCapture(
 
     def _target_info_changed(self, info: dict[str, Any]) -> None:
         target_id = str(info.get("targetId") or "")
-        session_id = self.target_sessions.get(target_id)
-        if not session_id:
-            return
         with self.state_lock:
+            session_id = self.target_sessions.get(target_id)
+            if not session_id or session_id not in self.enabled_sessions:
+                return
+            previous = self.targets.get(session_id) or {}
             self.targets[session_id] = copy.deepcopy(info)
+        if info.get("type") not in PAGE_TYPES:
+            return
+        new_origin = storage_origin(info.get("url"))
+        if not new_origin or new_origin == storage_origin(previous.get("url")):
+            return
+        # A tab usually attaches on about:blank and only then navigates to the
+        # application, so the origin's storage is set up when it first appears.
+        if self.config.capture_storage:
+            self.snapshot("navigation", sessions=[session_id], include_cookies=False)
+        if self.config.capture_client_storage:
+            self.track_client_storage(session_id, info)
 
     def _detached(self, session_id: str, reason: str) -> None:
         if not session_id:
             return
         with self.state_lock:
             for key in self.registry.keys_for_session(session_id):
-                entry = self.registry.entries.get(key)
-                if entry:
-                    entry["incomplete"] = True
-                    entry["incompleteReason"] = reason
-                    self.stats["incompleteFlushed"] += 1
-                    self._finalize(key, reason)
+                # A target that goes away cuts off its own in-flight requests;
+                # that is what happened in the browser, not a capture failure.
+                self._settle_entry(key, reason, incomplete_stat="incompleteDetached")
             for key, connection in list(self.open_websockets.items()):
                 if connection.get("sessionId") == session_id:
                     connection["incomplete"] = True
@@ -1068,7 +1121,13 @@ class CDPCapture(
             target = self.targets.pop(session_id, None)
             self.interaction_script_ids.pop(session_id, None)
             self.interaction_contexts.pop(session_id, None)
+            self.interaction_context_origins.pop(session_id, None)
             self.enabled_sessions.discard(session_id)
+            self.degraded_sessions.discard(session_id)
+            self._setup_acks = {ack for ack in self._setup_acks if ack[0] != session_id}
+            self._client_storage_origins = {
+                tracked for tracked in self._client_storage_origins if tracked[0] != session_id
+            }
             page_gone = bool(target and target.get("type") in PAGE_TYPES)
             if target and target.get("targetId"):
                 target_id = str(target["targetId"])
@@ -1088,6 +1147,57 @@ class CDPCapture(
         if page_gone:
             # A closing page may have written cookies the jar still holds.
             self.request_cookie_sync("targetDetached")
+
+    def _setup_methods(self) -> set[str]:
+        """Setup commands a page must have answered before it may load anything."""
+        methods = {"Network.enable", "Runtime.enable", "Page.enable"}
+        if self.config.body_mode != "none" and self.config.intercept_bodies != "none":
+            methods.add("Fetch.enable")
+        if self.config.capture_interactions:
+            methods.add("Page.addScriptToEvaluateOnNewDocument")
+        return methods
+
+    def open_start_url(self, url: str, timeout: float = 10.0) -> bool:
+        """Load the start URL in the first tab once that tab is fully instrumented.
+
+        Chrome launched with a URL starts loading it before the logger can
+        attach, so the page's first requests (document, login, bootstrap API
+        calls) were never captured. Chrome is launched on about:blank instead
+        and navigated here. Returns False when the tab was not ready in time;
+        the URL is still opened, but its first requests may be missing.
+        """
+        deadline = time.monotonic() + timeout
+        required = self._setup_methods()
+        session_id: str | None = None
+        ready = False
+        while time.monotonic() < deadline and self.is_live():
+            with self.state_lock:
+                session_id = next(
+                    (sid for sid, info in self.targets.items() if info.get("type") == "page"),
+                    None,
+                )
+                if session_id:
+                    answered = {method for sid, method in self._setup_acks if sid == session_id}
+                    ready = required <= answered
+            if ready:
+                break
+            time.sleep(0.05)
+        if session_id:
+            self.send(
+                "Page.navigate",
+                {"url": url},
+                session_id,
+                PendingCommand("optional_command", {"method": "Page.navigate"}, time.monotonic()),
+            )
+        else:
+            # No tab to reuse: a new target is paused by auto-attach until it
+            # is instrumented, so its first requests are captured as well.
+            self.send(
+                "Target.createTarget",
+                {"url": url},
+                pending=PendingCommand("optional_command", {"method": "Target.createTarget"}, time.monotonic()),
+            )
+        return ready
 
     def wait_for_pending_data(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -1170,7 +1280,7 @@ class CDPCapture(
         }
         for session_id, info in sessions:
             if info.get("type") in PAGE_TYPES:
-                if self.config.body_mode != "none":
+                if self.config.body_mode != "none" and self.config.intercept_bodies != "none":
                     self._send_quiesce("Fetch.disable", {}, session_id)
                 if self.config.capture_storage:
                     self._send_quiesce("DOMStorage.disable", {}, session_id)
@@ -1205,13 +1315,7 @@ class CDPCapture(
     def flush_open(self, reason: str = "shutdown") -> None:
         with self.state_lock:
             for key in list(self.registry.entries):
-                entry = self.registry.entries.get(key)
-                if entry:
-                    entry["incomplete"] = True
-                    entry["incompleteReason"] = reason
-                    entry.setdefault("finished", self.timestamps.normalize())
-                    self.stats["incompleteFlushed"] += 1
-                    self._finalize(key, reason)
+                self._settle_entry(key, reason, incomplete_stat="incompleteFlushed")
             for key, connection in list(self.open_websockets.items()):
                 connection["incomplete"] = True
                 connection["incompleteReason"] = reason

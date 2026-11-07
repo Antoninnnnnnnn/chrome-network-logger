@@ -150,24 +150,23 @@ def test_dom_storage_events_rebuild_the_current_values(tmp_path: Path) -> None:
 
 
 def test_attach_dump_seeds_the_mirror_that_events_build_on(tmp_path: Path) -> None:
-    capture, _, _ = make_capture(tmp_path)
-    capture._handle_snapshot_response(
-        "snapshot_storage",
-        {"label": "attach", "sessionId": "s"},
-        None,
-        {
-            "result": {
-                "value": {
-                    "origin": "https://example.test",
-                    "localStorage": {"ok": True, "values": {"seeded": "yes"}},
-                    "sessionStorage": {"ok": False, "error": "denied"},
-                }
-            }
-        },
-    )
+    capture, store, socket = make_capture(tmp_path)
+    capture.targets["s"] = {"targetId": "t", "type": "page", "url": "https://example.test/app"}
+    capture.snapshot("attach", sessions=["s"], include_cookies=False)
+    reads = {message["params"]["storageId"]["isLocalStorage"]: message for message in socket.sent}
+    assert all(message["method"] == "DOMStorage.getDOMStorageItems" for message in socket.sent)
+    capture._handle_command_response({"id": reads[True]["id"], "result": {"entries": [["seeded", "yes"]]}})
+    capture._handle_command_response({"id": reads[False]["id"], "error": {"code": -32000, "message": "denied"}})
+    retry = socket.sent[-1]
+    assert retry["params"]["storageId"] == {"storageKey": "https://example.test/", "isLocalStorage": False}
+    capture._handle_command_response({"id": retry["id"], "error": {"code": -32000, "message": "denied"}})
+    assert capture.wait_for_snapshots(0.01) is True
+    record = written(store, "snapshots/storage_attach.jsonl")[0]
+    assert record["storage"]["localStorage"] == {"ok": True, "values": {"seeded": "yes"}}
+    assert record["storage"]["sessionStorage"]["ok"] is False
     key = capture._dom_storage_key("https://example.test", True)
     assert capture._dom_storage[key]["values"] == {"seeded": "yes"}
-    assert capture._dom_storage_key("https://example.test", False) not in capture._dom_storage
+    assert capture._dom_storage_key("https://example.test", False, "s") not in capture._dom_storage
 
     capture._dom_storage_event(
         "s",

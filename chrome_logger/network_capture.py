@@ -448,6 +448,40 @@ class NetworkCaptureMixin:
                     entry["extraInfoIncomplete"] = True
                 self._finalize(key, reason)
 
+    def _settle_entry(self, key: str, reason: str, *, incomplete_stat: str) -> None:
+        """Finalize an entry because its target or the whole capture is ending.
+
+        Only a request that never finished loading is incomplete. One that did
+        finish but was still inside its ExtraInfo grace window, or waiting for
+        its body, is a complete request: it is written as such, with the
+        missing ExtraInfo or body recorded on the entry.
+        """
+        entry = self.registry.entries.get(key)
+        if not entry:
+            return
+        if not entry.get("_loadingComplete"):
+            entry["incomplete"] = True
+            entry["incompleteReason"] = reason
+            entry.setdefault("finished", self.timestamps.normalize())
+            self.stats[incomplete_stat] += 1
+            self._finalize(key, reason)
+            return
+        if entry.get("_pendingResponseBody") or entry.get("_pendingFetchBody"):
+            self._record_body_failure(
+                entry,
+                "responseBodyError",
+                {"code": -1, "message": f"The body was not returned before {reason}"},
+            )
+        if entry.get("_pendingPostData"):
+            entry.setdefault(
+                "requestPostDataError",
+                {"code": -1, "message": f"The request body was not returned before {reason}"},
+            )
+        if entry.get("_expectedResponseExtra") and not entry.get("_responseExtraSeen"):
+            entry["extraInfoIncomplete"] = True
+        scheduled = self.finalize_deadlines.get(key)
+        self._finalize(key, (scheduled[2] if scheduled and scheduled[2] else None) or reason)
+
     def _is_api(self, entry: dict[str, Any]) -> bool:
         request = entry.get("request") or {}
         method = str(request.get("method") or "").upper()

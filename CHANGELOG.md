@@ -2,6 +2,61 @@
 
 All notable changes to Chrome Network Logger are documented here.
 
+## 3.2.0 — 2026-11-07
+
+### Sessions ready for automated analysis
+
+- Write `INDEX.md` at the root of every session: outcome and its meaning, why the capture stopped, sensitive mode, warnings, key numbers, a table of every file with size and record count, how to open gzip bodies, and what CDP cannot see. It is the entry point for a reader — or an AI agent — that has never seen the format.
+- Record a `files` inventory (path, bytes, JSONL record count, body blob totals) in `manifest.json`.
+- Export `reports/session.har` (HAR 1.2) from the canonical stream, with bodies inlined up to 1 MiB and the capture id, failures and incompleteness kept in `_`-prefixed fields. `--no-har` turns it off.
+- Keep small binary WebSocket frames inline as `payloadBase64` (plus `payloadText` when printable) in raw mode instead of one body file per frame.
+
+### Fixed — capture correctness
+
+- `--start-url` lost the start page's first requests (document, login, bootstrap API calls): Chrome began loading the URL from its command line before the logger had attached. Chrome now always starts on `about:blank`, and the logger navigates to the start URL once the first tab has answered its Network/Runtime/Page/Fetch setup and the interaction script is installed. Verified against a local site: 0 of 4 page requests were captured before, 4 of 4 after.
+- IndexedDB and Cache Storage were never captured for a tab that attached on `about:blank` (the default start page) and then navigated: tracking only started for a URL known at attach time. It now starts whenever a page reaches a new origin, along with a baseline Web Storage read, and is registered per session so closing the first tab of an origin no longer stops events for the others.
+- Requests that had finished loading but were still inside their ExtraInfo grace window, or waiting for a body, were written as `incomplete` at shutdown and turned a clean stop into `partial`. They are now written as complete, with `extraInfoIncomplete` or a `responseBodyError` naming what was not returned.
+- Requests cut off because their own tab, iframe or worker closed are counted in the new `incompleteDetached` statistic and no longer make the session `partial`; `incompleteFlushed` keeps only requests in flight at shutdown.
+- IndexedDB dumps ran in whichever isolated context had the highest id, which could be a child iframe of another origin. They now run in the context of the origin being read, preferring the main frame.
+- An IndexedDB dump could create an empty database that the application had just deleted, or delay the application's own version upgrade. Dumps now skip missing databases, abort any upgrade, and close on `versionchange`.
+- A full storage dump replaces the reconstructed content of its area instead of merging, so keys deleted while no event was observed no longer survive in `dom_storage_final.json`. `sessionStorage` is kept per tab.
+- Web Storage snapshots are read with `DOMStorage.getDOMStorageItems` instead of JavaScript evaluated in the page's main world, so the page cannot observe them; pages without a web origin are skipped.
+
+### Fixed — stability
+
+- Starting a capture with `--profile-dir profiles/a` stopped any Chrome running on `profiles/ab`: processes were matched on a substring of their command line. The exact `--user-data-dir` path is now compared.
+- Chrome is closed with the DevTools `Browser.close` command. The previous `CTRL_BREAK_EVENT` never reached Chrome on Windows (it has no console), so every stop waited 5 seconds and then killed the browser, leaving an unclean profile. Signals and a hard kill remain fallbacks.
+- Orphan Chrome processes of the profile are terminated together and awaited once instead of up to 2 seconds each.
+- An exception in the CDP reader's housekeeping killed the reader thread and was reported as an ordinary browser disconnect (`partial`). Each task is now isolated; repeated failures or a failed writer make the capture fail explicitly.
+- `os.replace` is retried on Windows sharing violations (antivirus, indexers, open viewers) for the manifest, snapshots and bodies instead of failing the capture.
+- The writer queue is bounded in bytes (256 MiB) as well as in tasks, so a slow disk cannot pile up gigabytes of bodies in memory.
+- Manifest warnings are capped at 200 distinct messages (`warningsSuppressed` counts the rest); repeated oversized-payload warnings no longer create a new message each time.
+- Finished request ids no longer keep a hop counter for the whole session.
+
+### Proxy
+
+- Authenticated SOCKS5 proxies are supported through the loopback relay (RFC 1928/1929), with host names resolved on the proxy. Unauthenticated SOCKS stays a direct Chrome setting; authenticated SOCKS4 is still rejected.
+- **P** toggles the upstream on Linux and macOS too when the logger runs in an interactive terminal; the terminal mode is always restored. On Windows, the Down arrow no longer toggles the proxy.
+- The relay tunnel uses `selectors` instead of `select()`, which failed above 1024 file descriptors on Linux, and forwards data buffered inside TLS upstream sockets.
+- Bytes an HTTP upstream sends right after its `CONNECT` 200 are forwarded instead of dropped; a failure after the tunnel opened no longer writes a stray 502 into it.
+- `--proxy-prompt` with a closed stdin is a clear usage error.
+
+### Managed Chrome
+
+- The Chrome for Testing download reports its progress (every 10 %, or every 16 MiB without a known size).
+
+### CLI
+
+- Invalid configuration values are reported as usage errors (exit code 2) instead of tracebacks; `--max-idb-entries` and `--max-cache-entries` must be positive integers.
+- Prompts no longer crash when stdin is closed (pipes, services, CI).
+- Warn on Windows when the profile path exceeds 120 characters: Chrome then hits the 260-character path limit inside the profile and sites fail to use Cache Storage or IndexedDB (`UnknownError: Unexpected internal error`).
+- The stop summary names the signal that ended the capture and points to `INDEX.md`.
+- `Fetch.disable` is only sent when Fetch interception was enabled.
+
+### Documentation
+
+- README (EN/FR), threat model and capture schema now match the code: raw is the default mode, Fetch interception covers `Document`, `XHR` and `Fetch` by default, and the new files, fields and statistics are documented.
+
 ## 3.1.1 — 2026-09-05
 
 ### Fixed — response bodies were never stored

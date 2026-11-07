@@ -28,7 +28,7 @@ Outil Python pour capturer le **trafic applicatif visible par Chrome** avec le C
 - Relay proxy réécrit : sockets correctement suivis/fermés, IPv6, proxy HTTP ou HTTPS, bascule directe en live sous Windows.
 - Les erreurs fatales CDP/writer produisent un manifeste `error` et un code de sortie non nul, sans faux succès.
 - Payloads d’interaction, `ExtraInfo` en attente, connexions proxy et file du writer sont bornés.
-- Package typé, 136 tests, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
+- Package typé, suite de tests étendue, couverture imposée, validation du paquet, Dependabot, CodeQL et CI Windows/Linux/macOS sur Python 3.10 à 3.14.
 - Si aucun Chrome local n’existe, téléchargement et mise en cache automatiques du Chrome for Testing Stable officiel, sans ChromeDriver.
 
 ## Installation
@@ -57,7 +57,7 @@ Prérequis : Python 3.10+. Un Chrome/Chromium déjà installé est utilisé en p
 python chrome_network_logger.py
 ```
 
-Au premier lancement, un profil isolé et persistant est créé dans `./capture_profile`. Les sessions et connexions de ton Chrome principal ne sont pas utilisées. Si Chrome est absent, le binaire Stable officiel est téléchargé une seule fois dans le cache utilisateur (`%LOCALAPPDATA%\chrome-network-logger` sous Windows) puis réutilisé hors ligne. Aucun ChromeDriver, Selenium ou Playwright n’est installé.
+Au premier lancement, un profil isolé et persistant est créé dans `./capture_profile`. Les sessions et connexions de ton Chrome principal ne sont pas utilisées. Sous Windows, garde un `--profile-dir` court (moins de ~120 caractères) : Chrome range ses fichiers de stockage très profondément dans le profil et, au-delà de la limite de 260 caractères, les sites ne peuvent plus utiliser Cache Storage ni IndexedDB. Si Chrome est absent, le binaire Stable officiel est téléchargé une seule fois dans le cache utilisateur (`%LOCALAPPDATA%\chrome-network-logger` sous Windows) puis réutilisé hors ligne. Aucun ChromeDriver, Selenium ou Playwright n’est installé.
 
 Il s’agit d’un vrai processus Chrome visible, lancé sans mode headless, sans WebDriver, sans `--enable-automation` et avec un port CDP loopback non nul pour que Chrome ne force pas `navigator.webdriver=true`. Cela évite les marqueurs propres à Selenium/Playwright, mais **ne garantit pas l’indétectabilité** : un site peut toujours inférer un profil neuf, une instrumentation CDP, des extensions, le réseau ou d’autres caractéristiques de l’environnement.
 
@@ -100,10 +100,12 @@ Options importantes :
 | `--max-cache-entries 200` | Nombre maximal d'entrées Cache Storage par cache et par dump |
 | `--intercept-bodies api` | Types dont le corps est pris pendant la pause de la réponse, ce qui conserve les corps des cibles fermées en cours de requête |
 | `--durable-messages` | Active les messages durables CDP ; le Chrome actuel refuse alors de renvoyer les corps de réponse |
+| `--no-text-compression` | Stocke les bodies texte en clair plutôt qu'en `.gz` (plus simple pour les outils qui ne décompressent pas) |
+| `--no-har` | N'écrit pas `reports/session.har` |
 | `--snapshot-interval 0` | Snapshot cookies/storage périodique supplémentaire toutes les N secondes ; `0` s'appuie uniquement sur la capture par événements |
 | `--keep-chrome` | Laisse Chrome ouvert après avoir désactivé Fetch, l'auto-attach et les listeners injectés |
 | `--duration SECONDES` | Arrête et finalise automatiquement ; valeur finie et positive ou nulle |
-| `--start-url URL` | Page initiale ; `about:blank` par défaut évite le trafic spontané du nouvel onglet |
+| `--start-url URL` | Page initiale, ouverte seulement une fois le premier onglet instrumenté pour capturer ses premières requêtes ; `about:blank` par défaut |
 | `--proxy N\|random\|none` | Active explicitement un proxy ; `none`/connexion directe par défaut |
 | `--chrome-path PATH` | Chemin Chrome/Chromium explicite |
 | `--managed-chrome-dir PATH` | Emplacement du Chrome Stable officiel géré par l’outil |
@@ -115,7 +117,8 @@ Options importantes :
 
 ```text
 session_YYYYMMDD_HHMMSS_mmm_PID_ALÉA/
-├── manifest.json
+├── INDEX.md                 # point d'entrée : bilan, guide des fichiers, lecture des bodies
+├── manifest.json            # inclut un inventaire `files` avec tailles et nombre d'enregistrements
 ├── timeline.jsonl
 ├── network/
 │   ├── requests.jsonl
@@ -159,8 +162,11 @@ session_YYYYMMDD_HHMMSS_mmm_PID_ALÉA/
     ├── summary.txt
     ├── stats.txt
     ├── requests.csv
+    ├── session.har          # vue HAR 1.2, bodies intégrés jusqu'à 1 Mio
     └── interactions.html
 ```
+
+`INDEX.md` est écrit à la fin de la capture. Il donne le statut et la raison de l'arrêt, les chiffres clés, chaque fichier avec sa taille et son nombre d'enregistrements, la façon d'ouvrir les bodies compressés et les limites à connaître. C'est le point d'entrée prévu pour quiconque analyse la session, y compris un agent automatisé ou une IA qui découvre le format.
 
 `requests.jsonl` est canonique : il n'existe plus deux copies `full` et `filtered`. Le champ `isApi` permet de filtrer sans doubler les bodies sur disque.
 
@@ -178,7 +184,7 @@ Lorsque la limite globale est atteinte, les métadonnées restent présentes ave
 
 ## Masquage des secrets
 
-Le mode par défaut `--sensitive safe` masque notamment :
+Le mode optionnel `--sensitive safe` (le défaut est `raw`) masque notamment :
 
 - `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie` ;
 - mots de passe, secrets, clés API, tokens d'accès/refresh/ID ;
@@ -193,9 +199,9 @@ Une valeur masquée ressemble à :
 <redacted len=123 hmac=4ab31c8702ef>
 ```
 
-Le HMAC utilise une clé aléatoire créée pour chaque capture : deux valeurs identiques sont comparables **dans une même session**, mais pas entre deux sessions. La clé n’est pas écrite dans les logs. Les valeurs d’input et de formulaire sont masquées directement dans le monde isolé de la page sous la forme `<redacted len=N source=browser>` : la valeur brute ne traverse jamais le binding CDP et ce marqueur de longueur ne permet pas de comparer deux secrets. Le markup de l’élément devient un placeholder limité au nom du tag. Le mode `raw` doit être choisi explicitement.
+Le HMAC utilise une clé aléatoire créée pour chaque capture : deux valeurs identiques sont comparables **dans une même session**, mais pas entre deux sessions. La clé n’est pas écrite dans les logs. Les valeurs d’input et de formulaire sont masquées directement dans le monde isolé de la page sous la forme `<redacted len=N source=browser>` : la valeur brute ne traverse jamais le binding CDP et ce marqueur de longueur ne permet pas de comparer deux secrets. Le markup de l’élément devient un placeholder limité au nom du tag. Le mode `raw` est le défaut : un dossier de session contient alors des identifiants utilisables et doit être traité comme un secret.
 
-Le mode `safe` est une protection par défaut, pas une garantie absolue : un format propriétaire, payload binaire ou chiffré par l’application, ou une valeur sensible au nom inhabituel peut rester visible. Toute capture reste confidentielle. Consulte le [modèle de menace](https://github.com/Antoninnnnnnnn/chrome-network-logger/blob/main/docs/THREAT_MODEL.md).
+Le mode `safe` est une protection, pas une garantie absolue : un format propriétaire, payload binaire ou chiffré par l’application, ou une valeur sensible au nom inhabituel peut rester visible. Toute capture reste confidentielle. Consulte le [modèle de menace](https://github.com/Antoninnnnnnnn/chrome-network-logger/blob/main/docs/THREAT_MODEL.md).
 
 ## Proxy
 
@@ -223,9 +229,9 @@ python chrome_network_logger.py --proxy-prompt
 python chrome_network_logger.py --proxy-file autre.txt
 ```
 
-Pour les proxies HTTP/HTTPS, Chrome se connecte à un relay local sur `127.0.0.1`. Le relay ajoute l'authentification sans popup et peut être basculé entre proxy et connexion directe avec **P sous Windows**. Toutes les connexions actives sont alors fermées afin que le nouvel itinéraire soit réellement utilisé.
+Pour les proxies HTTP/HTTPS et SOCKS5 authentifiés, Chrome se connecte à un relay local sur `127.0.0.1`. Le relay ajoute l'authentification sans popup ; via SOCKS5, il transmet les noms d'hôte au proxy, qui fait donc la résolution DNS. La touche **P** bascule entre proxy et connexion directe (Windows, et Linux/macOS lorsque le logger tourne dans un terminal interactif). Toutes les connexions actives sont alors fermées afin que le nouvel itinéraire soit réellement utilisé.
 
-Les proxies SOCKS sans authentification sont passés directement à Chrome. L'authentification SOCKS n'est pas simulée silencieusement : elle est refusée avec une erreur claire. La validation TLS d'un proxy HTTPS reste active, sauf option explicite `--proxy-insecure-tls`.
+Les proxies SOCKS4/SOCKS5 sans authentification sont passés directement à Chrome. SOCKS4 avec authentification est refusé avec une erreur claire. La validation TLS d'un proxy HTTPS reste active, sauf option explicite `--proxy-insecure-tls`.
 
 La présence de `proxy.txt` n’active jamais un proxy à elle seule : le routage reste direct tant qu’un sélecteur explicite n’est pas fourni. Le relay borne aussi le nombre de connexions simultanées et répond `503` en cas de saturation.
 
@@ -236,7 +242,7 @@ La présence de `proxy.txt` n’active jamais un proxy à elle seule : le routag
 - Les réponses très volumineuses ou streaming peuvent dépasser les buffers CDP ou la limite choisie.
 - Les bodies des redirections HTTP ne sont pas exposés par `Fetch.getResponseBody` ; chaque hop reste néanmoins conservé avec sa réponse et ses headers.
 - WebRTC média/DataChannel et le trafic paquet brut restent hors périmètre.
-- L'interception `Fetch` est limitée aux réponses `Document` afin d'améliorer les navigations sans suspendre toutes les requêtes du navigateur.
+- L'interception `Fetch` ne met en pause, par défaut, que les réponses `Document`, `XHR` et `Fetch` (`--intercept-bodies`), jamais les réponses en streaming ni celles qui dépassent la limite par body.
 - Les capacités expérimentales optionnelles sont consignées dans `browser/protocol_capabilities.jsonl`. L’échec ou le timeout d’un domaine requis (`Network`, `Runtime`, `Page`, `Fetch` ou auto-attach) rend la capture invalide et donne un code de sortie non nul.
 
 Références officielles : [Network](https://chromedevtools.github.io/devtools-protocol/tot/Network/), [Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/), [Fetch](https://chromedevtools.github.io/devtools-protocol/tot/Fetch/).
@@ -250,10 +256,15 @@ chrome_logger/
 ├── network_capture.py     # HTTP, redirections, ExtraInfo et bodies
 ├── realtime_capture.py    # WebSocket, SSE et WebTransport
 ├── browser_capture.py     # interactions, console, navigation et snapshots
+├── state_capture.py       # cookies et Web Storage par événements
+├── client_storage.py      # dumps IndexedDB et Cache Storage
+├── har.py                 # export HAR 1.2 du flux canonique
+├── session_index.py       # INDEX.md, point d'entrée pour lecteurs et agents
+├── fileio.py              # remplacement atomique avec reprises sous Windows
 ├── registry.py            # identité session/request/hop et ordre des ExtraInfo
 ├── storage.py             # writer thread, JSONL, bodies et rapports
 ├── redaction.py           # masquage contextuel
-├── proxy.py               # parsing et relay HTTP(S)
+├── proxy.py               # parsing, relay HTTP(S)/SOCKS5 et bascule en direct
 ├── managed_chrome.py      # téléchargement/cache officiel et extraction sûre
 └── chrome.py              # lancement/nettoyage du profil dédié
 ```

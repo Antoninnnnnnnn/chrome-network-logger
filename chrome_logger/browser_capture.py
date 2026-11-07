@@ -5,6 +5,7 @@ import json
 import time
 from typing import Any
 
+from .client_storage import storage_origin
 from .constants import PAGE_TYPES
 from .models import PendingCommand
 
@@ -15,9 +16,10 @@ class BrowserCaptureMixin:
         payload_size = len(payload_text.encode("utf-8", errors="replace"))
         if payload_size > self.config.max_interaction_payload_bytes:
             self.stats["droppedUserEvents"] += 1
+            # One stable message: the count lives in stats.droppedUserEvents.
             self.store.add_warning(
-                f"Dropped an oversized interaction payload ({payload_size} bytes; "
-                f"limit {self.config.max_interaction_payload_bytes})"
+                "Dropped oversized interaction payloads "
+                f"(limit {self.config.max_interaction_payload_bytes} bytes; see stats.droppedUserEvents)"
             )
             return
         context_id = params.get("executionContextId")
@@ -112,43 +114,65 @@ class BrowserCaptureMixin:
                 {},
                 pending=PendingCommand("snapshot_cookies", {"label": label}, time.monotonic()),
             )
-        expression = """(() => {
-            const dump = (name, storageFactory) => {
-                try {
-                    const storage = storageFactory();
-                    const output = {};
-                    for (let i = 0; i < storage.length; i++) {
-                        const key = storage.key(i);
-                        output[key] = storage.getItem(key);
-                    }
-                    return {ok: true, values: output};
-                } catch (error) {
-                    return {ok: false, error: String(error), name};
-                }
-            };
-            return {
-                url: location.href,
-                origin: location.origin,
-                localStorage: dump('localStorage', () => window.localStorage),
-                sessionStorage: dump('sessionStorage', () => window.sessionStorage)
-            };
-        })()"""
         if sessions is None:
             with self.state_lock:
                 sessions = [sid for sid, info in self.targets.items() if info.get("type") in PAGE_TYPES]
         for session_id in sessions:
             with self.state_lock:
-                self._snapshot_pending += 1
-            self.send(
-                "Runtime.evaluate",
-                {"expression": expression, "returnByValue": True},
-                session_id,
-                PendingCommand(
-                    "snapshot_storage",
-                    {"label": label, "sessionId": session_id, "target": self._target(session_id)},
-                    time.monotonic(),
-                ),
-            )
+                info = copy.deepcopy(self.targets.get(session_id) or {})
+            origin = storage_origin(info.get("url"))
+            if not origin:
+                # about:blank, chrome:// and similar pages have no Web Storage.
+                continue
+            with self.state_lock:
+                self._storage_snapshot_group_id += 1
+                group_id = self._storage_snapshot_group_id
+                self._storage_snapshot_groups[group_id] = {
+                    "label": label,
+                    "sessionId": session_id,
+                    "target": self._target(session_id),
+                    "url": info.get("url"),
+                    "origin": origin,
+                    "remaining": 2,
+                    "sections": {},
+                }
+            for part in ("localStorage", "sessionStorage"):
+                self._send_storage_read(group_id, session_id, origin, part, use_storage_key=False)
+
+    def _send_storage_read(
+        self,
+        group_id: int,
+        session_id: str,
+        origin: str,
+        part: str,
+        *,
+        use_storage_key: bool,
+    ) -> None:
+        """Read one Web Storage area through CDP, without running page JavaScript."""
+        is_local = part == "localStorage"
+        storage_id: dict[str, Any] = (
+            {"storageKey": origin + "/", "isLocalStorage": is_local}
+            if use_storage_key
+            else {"securityOrigin": origin, "isLocalStorage": is_local}
+        )
+        with self.state_lock:
+            self._snapshot_pending += 1
+        self.send(
+            "DOMStorage.getDOMStorageItems",
+            {"storageId": storage_id},
+            session_id,
+            PendingCommand(
+                "snapshot_storage",
+                {
+                    "group": group_id,
+                    "part": part,
+                    "origin": origin,
+                    "sessionId": session_id,
+                    "storageKey": use_storage_key,
+                },
+                time.monotonic(),
+            ),
+        )
 
     def _handle_snapshot_response(
         self,
@@ -158,8 +182,8 @@ class BrowserCaptureMixin:
         result: dict[str, Any],
     ) -> None:
         try:
-            label = str(data.get("label") or "snapshot")
             if kind == "snapshot_cookies":
+                label = str(data.get("label") or "snapshot")
                 payload: dict[str, Any] = {"time": self.timestamps.normalize(), "label": label}
                 if error:
                     payload["error"] = error
@@ -168,31 +192,66 @@ class BrowserCaptureMixin:
                     # Keep the event-sourced jar aligned with explicit snapshots.
                     self._handle_cookie_sync({"reasons": [f"snapshot:{label}"]}, None, result)
                 self.store.write_json(f"snapshots/cookies_{label}.json", payload, redact=True)
-            else:
-                payload = {
-                    "time": self.timestamps.normalize(),
-                    "label": label,
-                    "sessionId": data.get("sessionId"),
-                    "target": data.get("target"),
-                }
-                exception_details = result.get("exceptionDetails")
-                if error:
-                    payload["error"] = error
-                elif exception_details:
-                    payload["error"] = exception_details
-                else:
-                    remote = result.get("result") or {}
-                    payload["storage"] = remote.get("value")
-                    if remote.get("subtype") == "error":
-                        payload["error"] = remote.get("description")
-                    dump = remote.get("value")
-                    if isinstance(dump, dict):
-                        self.seed_dom_storage(str(dump.get("origin") or ""), dump, f"dump:{label}")
-                self.store.write_jsonl(f"snapshots/storage_{label}.jsonl", payload, redact=True)
+                return
+            self._storage_read_response(data, error, result)
         finally:
             with self._snapshot_condition:
                 self._snapshot_pending = max(0, self._snapshot_pending - 1)
                 self._snapshot_condition.notify_all()
+
+    def _storage_read_response(self, data: dict[str, Any], error: Any, result: dict[str, Any]) -> None:
+        group_id = data.get("group")
+        part = str(data.get("part") or "")
+        if error and not data.get("storageKey") and self.is_live():
+            # securityOrigin is deprecated; retry once with the storageKey form.
+            with self.state_lock:
+                still_open = group_id in self._storage_snapshot_groups
+            if still_open:
+                self._send_storage_read(
+                    int(group_id),
+                    str(data.get("sessionId") or ""),
+                    str(data.get("origin") or ""),
+                    part,
+                    use_storage_key=True,
+                )
+                return
+        if error:
+            section: dict[str, Any] = {"ok": False, "error": error}
+        else:
+            values: dict[str, Any] = {}
+            for item in result.get("entries") or []:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    values[str(item[0])] = item[1]
+            section = {"ok": True, "values": values}
+        with self.state_lock:
+            group = self._storage_snapshot_groups.get(group_id)
+            if group is None:
+                return
+            group["sections"][part] = section
+            group["remaining"] -= 1
+            if group["remaining"] > 0:
+                return
+            self._storage_snapshot_groups.pop(group_id, None)
+        storage = {
+            "url": group.get("url"),
+            "origin": group.get("origin"),
+            "localStorage": group["sections"].get("localStorage"),
+            "sessionStorage": group["sections"].get("sessionStorage"),
+        }
+        label = str(group.get("label") or "snapshot")
+        payload = {
+            "time": self.timestamps.normalize(),
+            "label": label,
+            "sessionId": group.get("sessionId"),
+            "target": group.get("target"),
+            "source": "DOMStorage.getDOMStorageItems",
+            "storage": storage,
+        }
+        errors = [section.get("error") for section in group["sections"].values() if not section.get("ok")]
+        if errors:
+            payload["error"] = errors[0] if len(errors) == 1 else errors
+        self.seed_dom_storage(str(group.get("origin") or ""), storage, f"dump:{label}", group.get("sessionId"))
+        self.store.write_jsonl(f"snapshots/storage_{label}.jsonl", payload, redact=True)
 
     def wait_for_snapshots(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout

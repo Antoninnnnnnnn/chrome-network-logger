@@ -6,6 +6,13 @@ Every session is created under a unique `session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM`
 
 `schemaVersion: 3` is the compatibility boundary for canonical network records. New optional fields may be added within v3. Existing fields are not silently repurposed. Consumers must tolerate unknown fields and files that are absent because a capture option disabled them or Chrome did not expose the data.
 
+## Session index
+
+`INDEX.md` is written at the end of the capture and is the intended entry point for any reader, including an
+automated or AI analyst. It is derived from the manifest: status and its meaning, stop reason, sensitive mode,
+warnings, key statistics, a table of every file present (size, JSONL record count, purpose), how to open gzip
+bodies, and the caveats below. It is a guide, not a canonical input.
+
 ## Manifest
 
 `manifest.json` is updated atomically and contains:
@@ -14,9 +21,12 @@ Every session is created under a unique `session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM`
 - effective capture configuration and proxy route state;
 - warnings, capture statistics, writer health, and body-storage totals;
 - Chrome and protocol versions after a successful CDP connection;
-- `browserInstall`, identifying a system/explicit browser or the managed Stable version, platform, and locally computed archive/executable SHA-256 values.
+- `browserInstall`, identifying a system/explicit browser or the managed Stable version, platform, and locally computed archive/executable SHA-256 values;
+- `files`: every session file except body blobs as `{path, bytes, records?}` (`records` = line count of a JSONL file), plus one `network/bodies/` entry with the blob count and total size;
+- `warnings` (at most 200 distinct messages) and `warningsSuppressed` when more were dropped;
+- `writer.queuedBytesHighWatermark`, the peak amount of data waiting for the disk.
 
-An `error` status or non-zero process exit means the capture must not be treated as complete. A `partial` status indicates an unexpected browser/CDP close or incomplete flushed requests.
+An `error` status or non-zero process exit means the capture must not be treated as complete. A `partial` status indicates an unexpected browser/CDP close or requests still in flight at shutdown (`stats.incompleteFlushed`). Requests cut off because their own tab, iframe or worker closed are ordinary browsing; they are counted in `stats.incompleteDetached` and do not make a session partial.
 
 ## Canonical network stream
 
@@ -26,6 +36,11 @@ An `error` status or non-zero process exit means the capture must not be treated
 - normalized `started`/`finished` timestamps and optional `durationMs`;
 - `type`, `isApi`, `request`, `response`, `extraInfo`, and `failure`;
 - explicit incompleteness, missing `ExtraInfo`, body error, and finalization reasons.
+
+`incomplete: true` (with `incompleteReason`) is set only on a request that never finished loading. A request that
+had finished but was still waiting for its `ExtraInfo` or body when its target or the capture ended is written as
+complete, with `extraInfoIncomplete: true` and/or a `responseBodyError` / `requestPostDataError` explaining what was
+not returned.
 
 Private implementation fields beginning with `_` are removed before final records are written.
 
@@ -45,12 +60,12 @@ If the session body limit is reached, the record instead has `omitted: true`, `o
 ## Other streams
 
 - `timeline.jsonl`: normalized cross-domain summary events.
-- `realtime/`: WebSocket frames/errors/connections, SSE messages, and WebTransport lifecycle.
+- `realtime/`: WebSocket frames/errors/connections, SSE messages, and WebTransport lifecycle. Text frames carry `payloadData`; in raw mode a binary frame up to the inline limit carries `payloadBase64` (plus `payloadText` when it is printable UTF-8) instead of a body file; larger frames carry a body reference in `payload`.
 - `interactions/`: user and form events from the isolated interaction world.
 - `browser/`: targets, navigation, console, exceptions, logs, protocol diagnostics, and proxy toggles.
-- `snapshots/`: start/end/attach cookie and Web Storage dumps, plus `cookies_final.json` and `dom_storage_final.json` rebuilt from the event stream.
+- `snapshots/`: start/end/attach/navigation cookie and Web Storage dumps (Web Storage is read with `DOMStorage.getDOMStorageItems`, `source` names it, and pages without a web origin are skipped), plus `cookies_final.json` and `dom_storage_final.json` rebuilt from the event stream. A full dump replaces the reconstructed content of its area. `sessionStorage` belongs to one tab, so each tab has its own entry with a `sessionId` and a three-element `key`.
 - `storage/indexeddb.jsonl` and `storage/cache_storage.jsonl`: IndexedDB database lists, object-store schemas and bounded record dumps, plus Cache Storage cache lists and entry metadata, each line naming the `reason` that triggered the dump.
 - `storage/`: every state mutation as it happened — `cookie_changes.jsonl` (added/updated/removed cookies with the event that triggered the read), `dom_storage_events.jsonl` (localStorage/sessionStorage changes), and `page_flushes.jsonl` (full dumps sent by the injected script when a page is hidden, frozen, or unloaded).
-- `reports/`: derived human-readable text, CSV, and escaped HTML; these are not canonical inputs.
+- `reports/`: derived human-readable text, CSV, escaped HTML, and `session.har` (HAR 1.2, bodies inlined up to 1 MiB, custom `_`-prefixed fields keep the capture `id`, failures and incompleteness); these are not canonical inputs.
 
 See the README for CDP visibility limitations and `docs/THREAT_MODEL.md` for confidentiality boundaries.

@@ -5,6 +5,19 @@ import copy
 from typing import Any
 
 
+def _printable_text(encoded: str) -> str | None:
+    """Return a binary frame as text when it is valid, mostly printable UTF-8."""
+    try:
+        raw = base64.b64decode(encoded, validate=False)
+        text = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not text:
+        return None
+    printable = sum(char.isprintable() or char in "\r\n\t" for char in text)
+    return text if printable / len(text) > 0.9 else None
+
+
 class RealtimeCaptureMixin:
     def _websocket_key(self, session_id: str | None, request_id: str) -> str:
         return f"{session_id or 'root'}::{request_id}"
@@ -73,7 +86,14 @@ class RealtimeCaptureMixin:
                 inline_limit = self.config.websocket_inline_limit
                 if self.config.max_body_bytes:
                     inline_limit = min(inline_limit, self.config.max_body_bytes)
-                if estimated_bytes > inline_limit or binary_payload:
+                if binary_payload and estimated_bytes <= inline_limit and not self.store.redactor.enabled:
+                    # Small binary frames stay in the JSONL line: one body file
+                    # per frame would flood network/bodies/ on chatty sockets.
+                    frame["payloadBase64"] = payload_text
+                    text = _printable_text(payload_text)
+                    if text is not None:
+                        frame["payloadText"] = text
+                elif estimated_bytes > inline_limit or binary_payload:
                     frame["payload"] = self.store.store_body(
                         payload_text,
                         base64_encoded=binary_payload,

@@ -19,7 +19,10 @@ from typing import Any
 
 from . import __version__
 from .config import CaptureConfig
+from .fileio import replace_with_retry
+from .har import write_har
 from .redaction import Redactor
+from .session_index import write_session_index
 
 LOG = logging.getLogger(__name__)
 _SENTINEL = object()
@@ -113,6 +116,14 @@ def _text_encoding(content_type: str | None, raw: bytes) -> str:
     return candidate if candidate in _SAFE_TEXT_ENCODINGS else "utf-8"
 
 
+def _count_lines(path: Path) -> int:
+    count = 0
+    with open(path, "rb") as file:
+        while chunk := file.read(1024 * 1024):
+            count += chunk.count(b"\n")
+    return count
+
+
 def _csv_safe(value: Any) -> Any:
     """Prevent captured attacker-controlled text from becoming a spreadsheet formula."""
     if not isinstance(value, str):
@@ -142,6 +153,11 @@ class CaptureStore:
         for path in self.paths.values():
             path.mkdir(parents=True, exist_ok=True)
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=config.writer_queue_size)
+        self._queued_bytes = 0
+        self._queued_bytes_high_watermark = 0
+        self._bytes_condition = threading.Condition()
+        self._seen_warnings: set[str] = set()
+        self._suppressed_warnings = 0
         self._thread = threading.Thread(target=self._writer_loop, name="capture-writer", daemon=True)
         self._body_lock = threading.Lock()
         self._body_paths: dict[str, tuple[str, bool]] = {}
@@ -168,6 +184,10 @@ class CaptureStore:
                 "captureClipboard": config.capture_clipboard,
                 "captureConsole": config.capture_console,
                 "captureStorage": config.capture_storage,
+                "captureClientStorage": config.capture_client_storage,
+                "interceptBodies": config.intercept_bodies,
+                "compressTextBodies": config.compress_text_bodies,
+                "exportHar": config.export_har,
             },
             "warnings": [],
         }
@@ -184,16 +204,27 @@ class CaptureStore:
 
     def add_warning(self, warning: str) -> None:
         with self._manifest_lock:
+            if warning in self._seen_warnings:
+                return
+            if len(self._seen_warnings) < 10 * self.config.max_manifest_warnings:
+                self._seen_warnings.add(warning)
             warnings = self._manifest.setdefault("warnings", [])
-            if warning not in warnings:
-                warnings.append(warning)
-                self._write_manifest_atomic()
+            if warning in warnings:
+                return
+            if len(warnings) >= self.config.max_manifest_warnings:
+                # Keep the manifest small and cheap to rewrite; the count says
+                # how many distinct warnings were left out.
+                self._suppressed_warnings += 1
+                self._manifest["warningsSuppressed"] = self._suppressed_warnings
+                return
+            warnings.append(warning)
+            self._write_manifest_atomic()
 
     def _write_manifest_atomic(self) -> None:
         target = self.base / "manifest.json"
         temp = target.with_suffix(".json.tmp")
         temp.write_text(json.dumps(self._manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-        os.replace(temp, target)
+        replace_with_retry(temp, target)
 
     def write_jsonl(self, relative_path: str, payload: dict[str, Any], *, redact: bool = False) -> None:
         data = self.redactor.object(payload) if redact else payload
@@ -304,18 +335,48 @@ class CaptureStore:
             result["preview"] = raw.decode(text_encoding or "utf-8", errors="replace")
         return result
 
+    @staticmethod
+    def _task_size(task: Any) -> int:
+        if task is _SENTINEL or not isinstance(task, tuple) or len(task) < 3:
+            return 0
+        payload = task[2]
+        return len(payload) if isinstance(payload, (str, bytes, bytearray)) else 0
+
+    def _release_task_bytes(self, task: Any) -> None:
+        size = self._task_size(task)
+        if not size:
+            return
+        with self._bytes_condition:
+            self._queued_bytes = max(0, self._queued_bytes - size)
+            self._bytes_condition.notify_all()
+
     def _put(self, task: Any) -> None:
         if self._closed:
             raise RuntimeError("CaptureStore is closed")
-        while True:
-            self.check_health()
-            try:
-                self._queue.put(task, timeout=0.25)
-                self._queue_high_watermark = max(self._queue_high_watermark, self._queue.qsize())
+        size = self._task_size(task)
+        limit = self.config.writer_queue_max_bytes
+        with self._bytes_condition:
+            # Backpressure on bytes, not only on task count: a slow disk must
+            # not let thousands of 32 MiB bodies pile up in memory. A single
+            # task larger than the limit still goes through on an empty queue.
+            while self._queued_bytes and self._queued_bytes + size > limit:
                 self.check_health()
-                return
-            except queue.Full:
-                continue
+                self._bytes_condition.wait(timeout=0.25)
+            self._queued_bytes += size
+            self._queued_bytes_high_watermark = max(self._queued_bytes_high_watermark, self._queued_bytes)
+        try:
+            while True:
+                self.check_health()
+                try:
+                    self._queue.put(task, timeout=0.25)
+                    self._queue_high_watermark = max(self._queue_high_watermark, self._queue.qsize())
+                    self.check_health()
+                    return
+                except queue.Full:
+                    continue
+        except BaseException:
+            self._release_task_bytes(task)
+            raise
 
     def check_health(self) -> None:
         if self._writer_error:
@@ -343,7 +404,7 @@ class CaptureStore:
                     elif kind == "write_text":
                         temp = target.with_name(target.name + ".tmp")
                         temp.write_text(args[0], encoding="utf-8")
-                        os.replace(temp, target)
+                        replace_with_retry(temp, target)
                     elif kind == "write_body":
                         raw, compress = args
                         if not target.exists():
@@ -353,11 +414,12 @@ class CaptureStore:
                                     file.write(raw)
                             else:
                                 temp.write_bytes(raw)
-                            os.replace(temp, target)
+                            replace_with_retry(temp, target)
                     else:
                         raise ValueError(f"Unknown writer task: {kind}")
                     self._tasks_written += 1
                 finally:
+                    self._release_task_bytes(task)
                     self._queue.task_done()
         except BaseException as exc:  # keep the error for the producer thread
             self._writer_error = exc
@@ -368,6 +430,7 @@ class CaptureStore:
                 except queue.Empty:
                     break
                 else:
+                    self._release_task_bytes(pending)
                     self._queue.task_done()
                     if pending is _SENTINEL:
                         break
@@ -454,6 +517,13 @@ class CaptureStore:
         stats_lines.extend(f"  {key}: {value}" for key, value in sorted(counts.items()))
         (self.base / "reports" / "stats.txt").write_text("\n".join(stats_lines) + "\n", encoding="utf-8")
         self._generate_interactions_html()
+        if self.config.export_har:
+            try:
+                write_har(self.base, creator_version=__version__)
+            except Exception as exc:
+                # The HAR is a derived view; losing it must not fail the session.
+                LOG.exception("HAR export failed")
+                self.add_warning(f"HAR export failed with {type(exc).__name__}: {exc}")
 
     def _generate_interactions_html(self) -> None:
         source = self.base / "interactions" / "events.jsonl"
@@ -483,6 +553,31 @@ class CaptureStore:
                     )
             report.write("</body></html>\n")
 
+    def _file_inventory(self) -> list[dict[str, Any]]:
+        """List every session file except body blobs, with sizes and JSONL record counts."""
+        inventory: list[dict[str, Any]] = []
+        bodies = self.paths["bodies"]
+        body_count = 0
+        body_bytes = 0
+        for path in sorted(self.base.rglob("*")):
+            if not path.is_file() or path.name.endswith(".tmp"):
+                continue
+            size = path.stat().st_size
+            if bodies in path.parents:
+                body_count += 1
+                body_bytes += size
+                continue
+            relative = self.relative(path)
+            if relative in {"manifest.json", "INDEX.md"}:
+                continue
+            item: dict[str, Any] = {"path": relative, "bytes": size}
+            if path.suffix == ".jsonl":
+                item["records"] = _count_lines(path)
+            inventory.append(item)
+        if body_count:
+            inventory.append({"path": "network/bodies/", "bytes": body_bytes, "files": body_count})
+        return inventory
+
     def close(
         self,
         *,
@@ -511,6 +606,7 @@ class CaptureStore:
                     self._manifest["writer"] = {
                         "tasksWritten": self._tasks_written,
                         "queueHighWatermark": self._queue_high_watermark,
+                        "queuedBytesHighWatermark": self._queued_bytes_high_watermark,
                         "error": str(self._writer_error) if self._writer_error else None,
                     }
                     self._manifest["bodyStorage"] = {
@@ -524,6 +620,15 @@ class CaptureStore:
                         warnings = self._manifest.setdefault("warnings", [])
                         if warning not in warnings:
                             warnings.append(warning)
+                    try:
+                        self._manifest["files"] = self._file_inventory()
+                        write_session_index(self.base, self._manifest)
+                    except Exception as exc:
+                        # The index only guides readers; the data is already on disk.
+                        LOG.exception("Session index generation failed")
+                        self._manifest.setdefault("warnings", []).append(
+                            f"Session index generation failed with {type(exc).__name__}: {exc}"
+                        )
                     self._write_manifest_atomic()
             except BaseException as exc:
                 failure = failure or exc

@@ -13,8 +13,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import psutil
+import websocket
 
 LOG = logging.getLogger(__name__)
 
@@ -26,23 +28,31 @@ class ChromeProcess:
     profile_dir: Path
 
     def terminate(self, timeout: float = 5.0) -> None:
+        """Close Chrome cleanly, falling back to a signal and then a hard kill.
+
+        Browser.close lets Chrome flush its profile (cookies, session state) and
+        record a clean exit, so the next launch shows no crash-restore prompt.
+        CTRL_BREAK_EVENT is not used: on Windows Chrome is a GUI process with no
+        console, so it never receives it and the logger only waited it out.
+        """
         try:
+            if self.process.poll() is None and self.port and request_browser_close(self.port):
+                try:
+                    self.process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    LOG.debug("Chrome did not exit within %.1fs of Browser.close", timeout)
             if self.process.poll() is None:
                 try:
                     if os.name == "nt":
-                        self.process.send_signal(signal.CTRL_BREAK_EVENT)
+                        self.process.terminate()
                     else:
                         os.killpg(self.process.pid, signal.SIGTERM)
-                    self.process.wait(timeout=timeout)
+                    self.process.wait(timeout=2)
                 except Exception:
                     try:
-                        self.process.terminate()
-                        self.process.wait(timeout=2)
-                    except Exception:
-                        try:
-                            self.process.kill()
-                        except Exception as exc:
-                            LOG.debug("Could not kill Chrome launcher process: %s", exc)
+                        self.process.kill()
+                    except Exception as exc:
+                        LOG.debug("Could not kill Chrome launcher process: %s", exc)
         finally:
             # Chrome's launcher may exit before its browser children. Always
             # clean up processes that still reference our dedicated profile.
@@ -87,40 +97,107 @@ def find_chrome(explicit: Path | None = None) -> Path:
     raise FileNotFoundError("Chrome/Chromium was not found. Use --chrome-path.")
 
 
-def kill_profile_chrome_processes(profile_dir: Path) -> int:
-    profile_text = str(profile_dir.resolve()).casefold()
-    killed = 0
-    for process in psutil.process_iter(["name", "cmdline"]):
+def _normalized_path(value: str | Path) -> str:
+    text = str(value).strip().strip('"').strip("'")
+    return os.path.normcase(os.path.normpath(text))
+
+
+def user_data_dir_argument(cmdline: list[str] | None) -> str | None:
+    """Return the value of Chrome's --user-data-dir flag, if present."""
+    arguments = list(cmdline or [])
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--user-data-dir="):
+            return argument.split("=", 1)[1]
+        if argument == "--user-data-dir" and index + 1 < len(arguments):
+            return arguments[index + 1]
+    return None
+
+
+def uses_profile(cmdline: list[str] | None, profile_dir: Path) -> bool:
+    """Report whether a command line runs Chrome on exactly this profile.
+
+    The flag value is compared as a whole path: a substring test matches
+    `profiles/ab` when looking for `profiles/a` and kills the wrong browser.
+    """
+    value = user_data_dir_argument(cmdline)
+    if not value:
+        return False
+    try:
+        wanted: Path = profile_dir.resolve()
+    except OSError:
+        wanted = profile_dir
+    return _normalized_path(value) == _normalized_path(wanted)
+
+
+def _profile_processes(profile_dir: Path) -> list[psutil.Process]:
+    matches: list[psutil.Process] = []
+    for process in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             name = (process.info.get("name") or "").casefold()
             if "chrome" not in name and "chromium" not in name:
                 continue
-            command = " ".join(process.info.get("cmdline") or []).casefold()
-            if profile_text in command:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except psutil.TimeoutExpired:
-                    process.kill()
-                killed += 1
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            if uses_profile(process.info.get("cmdline"), profile_dir):
+                matches.append(process)
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, TypeError, ValueError):
             continue
-    return killed
+    return matches
+
+
+def kill_profile_chrome_processes(profile_dir: Path, timeout: float = 3.0) -> int:
+    """Stop every Chrome process of the dedicated profile, all at once."""
+    processes = _profile_processes(profile_dir)
+    if not processes:
+        return 0
+    for process in processes:
+        try:
+            process.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    _, alive = psutil.wait_procs(processes, timeout=timeout)
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    if alive:
+        psutil.wait_procs(alive, timeout=2)
+    return len(processes)
 
 
 def profile_chrome_process_ids(profile_dir: Path) -> list[int]:
     """Return Chrome processes that still explicitly reference the dedicated profile."""
-    profile_text = str(profile_dir.resolve()).casefold()
-    matches: list[int] = []
-    for process in psutil.process_iter(["pid", "name", "cmdline"]):
+    return [int(process.pid) for process in _profile_processes(profile_dir)]
+
+
+def request_browser_close(port: int, timeout: float = 2.0) -> bool:
+    """Ask Chrome to exit cleanly through its loopback DevTools endpoint."""
+    try:
+        version = fetch_json(port, "/json/version", timeout=timeout)
+        url = str(version["webSocketDebuggerUrl"])
+        parsed = urlsplit(url)
+        if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or parsed.port != port:
+            LOG.debug("Refusing to close Chrome through an unexpected endpoint: %r", url)
+            return False
+        connection = websocket.create_connection(url, timeout=timeout, suppress_origin=True)
+    except Exception as exc:
+        LOG.debug("Chrome DevTools endpoint unavailable for Browser.close: %s", exc)
+        return False
+    try:
+        connection.send(json.dumps({"id": 1, "method": "Browser.close"}))
         try:
-            name = (process.info.get("name") or "").casefold()
-            command = " ".join(process.info.get("cmdline") or []).casefold()
-            if ("chrome" in name or "chromium" in name) and profile_text in command:
-                matches.append(int(process.info["pid"]))
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, TypeError, ValueError):
-            continue
-    return matches
+            connection.recv()
+        except Exception as exc:
+            # Chrome may drop the socket before answering; it is closing anyway.
+            LOG.debug("No Browser.close acknowledgement: %s", exc)
+        return True
+    except Exception as exc:
+        LOG.debug("Browser.close could not be sent: %s", exc)
+        return False
+    finally:
+        try:
+            connection.close()
+        except Exception as exc:
+            LOG.debug("Could not close the Browser.close connection: %s", exc)
 
 
 def cleanup_profile_locks(profile_dir: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Any
 
 
@@ -18,6 +19,11 @@ class RequestRegistry:
         self.keys_by_base: dict[str, list[str]] = {}
         self.pending_request_extra: dict[str, list[dict[str, Any]]] = {}
         self.pending_response_extra: dict[str, list[dict[str, Any]]] = {}
+        # Hop counters of finished requests, kept briefly so a late event for an
+        # already-finalized request id never reuses a hop id. Bounded so a long
+        # capture does not keep one counter per request ever seen.
+        self.retired_hops: OrderedDict[str, int] = OrderedDict()
+        self.max_retired_hops = 10_000
         self.max_pending_bases = 10_000
         self.max_pending_per_base = 32
         self.dropped_extra = 0
@@ -48,7 +54,10 @@ class RequestRegistry:
 
     def create(self, session_id: str | None, request_id: str, entry: dict[str, Any]) -> str:
         base = self.base_key(session_id, request_id)
-        hop = self.hops.get(base, -1) + 1
+        previous_hop = self.hops.get(base)
+        if previous_hop is None:
+            previous_hop = self.retired_hops.pop(base, -1)
+        hop = previous_hop + 1
         self.hops[base] = hop
         key = f"{base}::hop{hop}"
         entry["id"] = key
@@ -72,9 +81,19 @@ class RequestRegistry:
                 self.keys_by_base.pop(base, None)
                 self.pending_request_extra.pop(base, None)
                 self.pending_response_extra.pop(base, None)
+                self._retire_hop(base)
         if self.active.get(base) == key:
             self.active.pop(base, None)
         return entry
+
+    def _retire_hop(self, base: str) -> None:
+        hop = self.hops.pop(base, None)
+        if hop is None:
+            return
+        self.retired_hops[base] = hop
+        self.retired_hops.move_to_end(base)
+        while len(self.retired_hops) > self.max_retired_hops:
+            self.retired_hops.popitem(last=False)
 
     def _assign(self, key: str, side: str, payload: dict[str, Any]) -> None:
         entry = self.entries[key]
