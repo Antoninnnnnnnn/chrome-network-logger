@@ -294,7 +294,14 @@ def test_posix_toggle_with_a_real_pseudo_terminal(monkeypatch) -> None:
         stop.set()
         thread.join(timeout=2)
         assert not thread.is_alive()
-        assert termios.tcgetattr(slave) == original
+        restored = termios.tcgetattr(slave)
+        # BSD kernels (macOS) set PENDIN by themselves when a tty switches back
+        # to canonical mode, to retype pending input; it is not ours to restore.
+        pendin = getattr(termios, "PENDIN", 0)
+        restored[3] &= ~pendin
+        expected = list(original)
+        expected[3] &= ~pendin
+        assert restored == expected
         assert registered == []
     finally:
         os.close(master)
