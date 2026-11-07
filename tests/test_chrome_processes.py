@@ -110,6 +110,27 @@ def test_terminate_falls_back_when_browser_close_fails(monkeypatch, tmp_path: Pa
     assert process.terminated
 
 
+def test_a_browser_the_user_closed_is_not_asked_to_close_again(monkeypatch, tmp_path: Path) -> None:
+    process = ClosingProcess(exits_on_close=False)
+    process.closed = True  # the user closed the window; Chrome exits on its own
+    process.exits_on_close = True
+    asked: list[int] = []
+    monkeypatch.setattr(chrome_module, "request_browser_close", lambda port, timeout=2.0: asked.append(port) or True)
+    monkeypatch.setattr(chrome_module, "kill_profile_chrome_processes", lambda _path: 0)
+    ChromeProcess(process=process, port=9333, profile_dir=tmp_path).terminate(already_closing=True)  # type: ignore[arg-type]
+    assert asked == [] and not process.terminated and not process.killed
+
+
+def test_a_browser_stuck_while_closing_is_still_stopped(monkeypatch, tmp_path: Path) -> None:
+    process = ClosingProcess(exits_on_close=False)
+    monkeypatch.setattr(chrome_module, "CLOSING_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(chrome_module, "request_browser_close", lambda _port, timeout=2.0: True)
+    monkeypatch.setattr(chrome_module, "kill_profile_chrome_processes", lambda _path: 0)
+    monkeypatch.setattr(chrome_module.os, "killpg", lambda _pid, _sig: process.terminate(), raising=False)
+    ChromeProcess(process=process, port=9333, profile_dir=tmp_path).terminate(already_closing=True)  # type: ignore[arg-type]
+    assert process.terminated
+
+
 class FakeConnection:
     def __init__(self) -> None:
         self.sent: list[str] = []

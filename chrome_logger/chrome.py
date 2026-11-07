@@ -21,22 +21,35 @@ import websocket
 LOG = logging.getLogger(__name__)
 
 
+# How long a browser the user closed may take to exit by itself.
+CLOSING_GRACE_SECONDS = 3.0
+
+
 @dataclass(slots=True)
 class ChromeProcess:
     process: subprocess.Popen[Any]
     port: int
     profile_dir: Path
 
-    def terminate(self, timeout: float = 5.0) -> None:
+    def terminate(self, timeout: float = 5.0, *, already_closing: bool = False) -> None:
         """Close Chrome cleanly, falling back to a signal and then a hard kill.
 
         Browser.close lets Chrome flush its profile (cookies, session state) and
         record a clean exit, so the next launch shows no crash-restore prompt.
         CTRL_BREAK_EVENT is not used: on Windows Chrome is a GUI process with no
         console, so it never receives it and the logger only waited it out.
+
+        ``already_closing`` means the user closed the browser: its DevTools
+        endpoint is going away, so asking it to close would only time out.
+        Chrome gets a short grace period to finish on its own instead.
         """
         try:
-            if self.process.poll() is None and self.port and request_browser_close(self.port):
+            if already_closing and self.process.poll() is None:
+                try:
+                    self.process.wait(timeout=min(timeout, CLOSING_GRACE_SECONDS))
+                except subprocess.TimeoutExpired:
+                    LOG.debug("Chrome was still closing after %.1fs", CLOSING_GRACE_SECONDS)
+            elif self.process.poll() is None and self.port and request_browser_close(self.port):
                 try:
                     self.process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:

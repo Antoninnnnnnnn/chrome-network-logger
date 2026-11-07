@@ -527,6 +527,12 @@ def main(argv: list[str] | None = None) -> int:
         if keyboard_thread is not None:
             # Lets the toggle thread restore the terminal mode before exit.
             keyboard_thread.join(timeout=1)
+        # Large sessions take a while to finalize (reports, HAR export): say so
+        # at once, so the stop does not look stuck and the window stays open.
+        print(
+            f"\nStopping ({_human_reason(shutdown_reason)}); saving the session, do not close this window...",
+            flush=True,
+        )
         if capture and capture_connected:
             browser_live = capture.is_live() and not (chrome and chrome.process.poll() is not None)
             if not browser_live:
@@ -563,7 +569,7 @@ def main(argv: list[str] | None = None) -> int:
                 safe_warning(f"Proxy relay shutdown failed: {exc}")
         if chrome and not args.keep_chrome:
             try:
-                chrome.terminate()
+                chrome.terminate(already_closing=shutdown_reason in {"chromeExited", "cdpDisconnected"})
             except Exception as exc:
                 exit_code = 1
                 safe_warning(f"Chrome shutdown failed: {exc}")

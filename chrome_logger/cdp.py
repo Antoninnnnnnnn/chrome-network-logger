@@ -864,7 +864,14 @@ class CDPCapture(
         if kind == "interaction_binding":
             if error:
                 self.stats["protocolErrors"] += 1
-                self.store.add_warning(f"Interaction binding unavailable for session {data.get('sessionId')}: {error}")
+                if self._session_is_gone(data.get("sessionId"), error):
+                    # The tab or iframe closed before Chrome answered: nothing
+                    # was lost, so it is not a warning for the analyst.
+                    self.stats["detachedSessionCommands"] += 1
+                else:
+                    self.store.add_warning(
+                        f"Interaction binding unavailable for session {data.get('sessionId')}: {error}"
+                    )
             return
         if kind == "interaction_script":
             session_id = str(data.get("sessionId") or "")

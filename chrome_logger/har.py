@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import re
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -84,6 +85,7 @@ class _Export:
     orphan_frames: int = 0
     skipped: list[dict[str, Any]] = field(default_factory=list)
     skipped_count: int = 0
+    bodies_inside: bool | None = None
 
     def skip(self, line: int, reason: str) -> None:
         LOG.debug("HAR export skipped %s line %s: %s", REQUESTS_FILE, line, reason)
@@ -161,6 +163,9 @@ def _sort_time(record: dict[str, Any]) -> float:
     return math.inf
 
 
+_STARTED_MS = re.compile(rb'"started":\{"epochMs":(-?\d+(?:\.\d+)?)[,}]')
+
+
 def _index_records(handle: IO[bytes], state: _Export) -> tuple[list[tuple[float, int, int]], set[str]]:
     index: list[tuple[float, int, int]] = []
     websocket_ids: set[str] = set()
@@ -169,6 +174,12 @@ def _index_records(handle: IO[bytes], state: _Export) -> tuple[list[tuple[float,
         start = offset
         offset += len(line)
         if not line.strip():
+            continue
+        # Decoding every record twice made the export slow on large sessions;
+        # the write pass decodes it anyway and reports a malformed line there.
+        started = _STARTED_MS.search(line)
+        if started and b'"type":"WebSocket"' not in line:
+            index.append((float(started.group(1)), line_number, start))
             continue
         record, error = _parse_line(line)
         if not isinstance(record, dict):
@@ -258,7 +269,7 @@ def _write_log(
             continue
         try:
             entry, connection = _build_entry(record, state)
-            text = _dump(entry, _ENTRY_PAD)
+            text = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
         except Exception as exc:  # one odd record must not abort the whole export
             state.skip(line_number, f"could not be converted ({type(exc).__name__}: {exc})")
             continue
@@ -513,7 +524,21 @@ def _reference_notes(reference: dict[str, Any]) -> list[str]:
     return notes
 
 
+_BODY_FILE = re.compile(r"network/bodies/[A-Za-z0-9][A-Za-z0-9._+-]*")
+
+
 def _contained(state: _Export, relative: str) -> Path | None:
+    if _BODY_FILE.fullmatch(relative):
+        # A plain file name in the bodies directory: one check of the
+        # directory, then only a symlink test per file.
+        if state.bodies_inside is None:
+            try:
+                state.bodies_inside = (state.session_dir / "network" / "bodies").resolve().is_relative_to(state.root)
+            except (OSError, RuntimeError, ValueError):
+                state.bodies_inside = False
+        candidate = state.session_dir / relative
+        if state.bodies_inside and not candidate.is_symlink():
+            return candidate
     try:
         candidate = (state.session_dir / relative).resolve()
     except (OSError, RuntimeError, ValueError):

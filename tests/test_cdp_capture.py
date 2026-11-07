@@ -710,3 +710,13 @@ def test_required_command_timeout_on_page_stays_fatal(tmp_path: Path) -> None:
     )
     capture._process_pending_timeouts()
     assert capture.failure.is_set()
+
+
+def test_binding_failure_of_a_session_that_already_closed_is_not_a_warning(tmp_path: Path) -> None:
+    capture, store = make_capture(tmp_path)
+    capture.pending[1] = PendingCommand("interaction_binding", {"sessionId": "gone"}, time.monotonic())
+    capture._handle_command_response(
+        {"id": 1, "error": {"code": -32001, "message": "Session with given id not found."}}
+    )
+    assert store.warnings == []
+    assert capture.stats["detachedSessionCommands"] == 1

@@ -19,6 +19,13 @@ All notable changes to Chrome Network Logger are documented here.
 - Cookies written by page script (`document.cookie`, `cookieStore.set`) trigger a cookie-jar read, so they appear when they are written (`pageScript:` reasons, `stats.cookieHints`).
 - With `--no-interactions`, the isolated-world script is still installed for storage capture: page storage dumps on `pagehide`/`freeze`/hidden and script-written cookies were silently missing.
 
+### Faster stop
+
+- Closing the browser window no longer delays the end of the capture by 2 to 13 seconds: the logger used to ask the already-closing browser to close over DevTools (a 2-second timeout) and then waited up to 7 more seconds. It now gives Chrome a 3-second grace period to exit by itself.
+- A message appears as soon as the stop is detected ("saving the session, do not close this window"), so finalizing a large session no longer looks stuck.
+- The HAR export writes one compact line per entry: the same entries, about 20 % smaller and faster to write. On a large session most of its time is still spent inlining bodies; `--no-har` skips it.
+- A tab or iframe that closes before answering the interaction setup is no longer reported as a warning.
+
 ### Sessions easier to analyse
 
 - Write `reports/overview.md`, a bounded digest of the session: pages visited (with single-page-application route changes), HTTP errors, network failures, incomplete requests, console errors and uncaught exceptions, API endpoints grouped by method and path with identifiers collapsed, the requests that followed each click, submit, change or key press in the same tab, and hosts. Every row names the record `id` to look up. Its headline numbers are stored in `manifest.json` under `analysis`, shown in `INDEX.md`, and `INDEX.md` sends readers to the overview first.
