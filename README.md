@@ -21,7 +21,7 @@ Python toolkit for capturing **Chrome application-layer traffic** through the Ch
 - One canonical source: `network/requests.jsonl`.
 - Normalized timestamps (`epochMs`, local ISO time, and CDP monotonic time when available).
 - IndexedDB and Cache Storage captured from `Storage` events, with bounded record dumps read from the page so values are real data instead of `RemoteObject` references.
-- Cookies and Web Storage captured from events, not samples: every `DOMStorage` mutation, a cookie-jar diff after each event that can change it, and a full page dump on `pagehide`/`freeze`/`visibilitychange` so closing the browser keeps the final state.
+- Cookies and Web Storage captured from events, not samples: every `DOMStorage` mutation, a cookie-jar diff after each event that can change it (including cookies written by page script, reported by `cookieStore` or a once-a-second check of `document.cookie`), and a full page dump on `pagehide`/`freeze`/`visibilitychange` so closing the browser keeps the final state.
 - Dedicated browser console, exception, log, navigation, and target files.
 - A single interaction script installed in an isolated JavaScript world; safe mode redacts every form-control value and never exports raw `outerHTML`.
 - Captures are raw by default so bodies, cookies and tokens stay usable; `--sensitive safe` redacts them while retaining their length and a per-session HMAC.
@@ -91,7 +91,7 @@ Important options:
 | `--max-body-mb 32` | Maximum stored bytes per body; `0` means unlimited |
 | `--max-session-body-mb 2048` | Maximum total unique stored body bytes per session; `0` means unlimited |
 | `--sensitive raw\|safe` | `raw` (default) keeps values as captured; `safe` redacts them |
-| `--no-interactions` | Disable injected clicks, inputs, forms, and SPA navigation events |
+| `--no-interactions` | Disable injected clicks, inputs, forms, and SPA navigation events (the isolated-world script stays for storage capture unless `--no-storage` is also given) |
 | `--capture-clipboard` | Capture pasted text; redacted in safe mode |
 | `--no-console` | Disable console, exceptions, and Log-domain files |
 | `--no-storage` | Disable cookie and Web Storage snapshots |
@@ -107,6 +107,7 @@ Important options:
 | `--duration SECONDS` | Stop and finalize automatically; must be finite and non-negative |
 | `--start-url URL` | Initial page, opened only once the first tab is instrumented so its first requests are captured; defaults to `about:blank` |
 | `--proxy N\|random\|none` | Use an explicitly selected proxy; `none`/direct is the default |
+| `--no-proxy-check` | Skip the check, before Chrome starts, that the proxy is reachable and accepts its credentials |
 | `--chrome-path PATH` | Explicit Chrome/Chromium executable |
 | `--managed-chrome-dir PATH` | Cache location for the official managed Stable browser |
 | `--no-download-chrome` | Fail instead of downloading Chrome when no browser is installed |
@@ -189,6 +190,10 @@ python chrome_network_logger.py --proxy-prompt
 HTTP(S) upstreams and authenticated SOCKS5 upstreams use a loopback relay that injects the credentials, so Chrome never shows an authentication prompt. Through SOCKS5 the relay sends host names to the proxy, so DNS resolves on the proxy side. Press **P** to switch between the upstream and direct routing (Windows, and Linux/macOS when the logger runs in an interactive terminal); active sockets are closed during a switch. Unauthenticated SOCKS4/SOCKS5 proxies are passed directly to Chrome, and authenticated SOCKS4 is rejected clearly. HTTPS upstream certificate verification is enabled unless `--proxy-insecure-tls` is explicitly used. Whenever a proxy is selected, Chrome also gets `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, so a page cannot learn the real address through WebRTC/STUN.
 
 Merely having a `proxy.txt` file never enables a proxy: routing remains direct until `--proxy`, `--proxy-prompt`, or another explicit selector is used. The relay also limits concurrent connections and returns `503` when saturated.
+
+Before Chrome starts, the selected proxy is checked: unreachable, a failed TLS handshake, or credentials refused (`407`, or a SOCKS5 login refusal) stop the logger with a clear message. The check contacts no third-party host — an HTTP(S) proxy is asked to `CONNECT` to its own loopback discard port — and `--no-proxy-check` skips it.
+
+The relay carries the upstream credentials, so it only serves the Chrome the logger launched: each connection is matched to the process that opened it, and other local processes are refused (recorded as a warning). Where processes cannot be inspected (a sandboxed browser), it says so and accepts local connections. It refuses origin-form requests and requests aimed at itself. An upstream `407` is turned into a `502` with an explanation instead of reaching Chrome, which would otherwise ask for a login in a loop; upstream failures are recorded once in the manifest warnings.
 
 ## CDP scope and limitations
 

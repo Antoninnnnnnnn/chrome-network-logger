@@ -308,6 +308,8 @@ class BrowserCaptureMixin:
   const MARKER = __MARKER__;
   const SAFE = __SAFE__;
   const CAPTURE_CLIPBOARD = __CLIPBOARD__;
+  const INTERACTIONS = __INTERACTIONS__;
+  const STORAGE = __STORAGE__;
   if (window[MARKER]) return;
   const send = window[BINDING];
   if (typeof send !== 'function') return;
@@ -458,23 +460,32 @@ class BrowserCaptureMixin:
   const base = (event, target, e) => ({
     event, ts: Date.now(), url: location.href, trusted: e ? e.isTrusted : null, target: describe(target)
   });
-  document.addEventListener('click', (e) => emit({...base('click', e.target, e), button: e.button, x: e.clientX, y: e.clientY}), listenerOptions);
-  document.addEventListener('change', (e) => emit(base('change', e.target, e)), listenerOptions);
-  const timers = new WeakMap();
-  document.addEventListener('input', (e) => {
-    if (!(e.target instanceof Element)) return;
-    clearTimeout(timers.get(e.target));
-    timers.set(e.target, setTimeout(() => emit(base('input', e.target, e)), 300));
-  }, listenerOptions);
-  document.addEventListener('keydown', (e) => {
-    const key = e.key || '';
-    if (e.repeat || e.isComposing || key === 'Process' || key === 'Dead') return;
-    // AltGr reports Ctrl+Alt on Windows: AltGr+2 is "@" typed, not a shortcut.
-    const altGraph = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
-    if (key.length <= 1 && (altGraph || (!e.ctrlKey && !e.metaKey))) return;
-    emit({...base('keydown', e.target, e), key, code: e.code, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey});
-  }, listenerOptions);
-  document.addEventListener('focusin', (e) => emit(base('focus', e.target, e)), listenerOptions);
+  // Events from inside open shadow roots reach document listeners retargeted
+  // to the host; composedPath()[0] is the element actually used. change and
+  // submit do not cross shadow boundaries at all, so every open shadow root
+  // seen on an event path also gets those two listeners.
+  const watchedRoots = new WeakSet();
+  const handled = new WeakSet();
+  const firstTime = (e) => {
+    if (handled.has(e)) return false;
+    handled.add(e);
+    return true;
+  };
+  const watchRoot = (root) => {
+    if (watchedRoots.has(root)) return;
+    watchedRoots.add(root);
+    root.addEventListener('change', onChange, listenerOptions);
+    root.addEventListener('submit', onSubmit, listenerOptions);
+  };
+  const eventTarget = (e) => {
+    let path = [];
+    try { path = e.composedPath(); } catch (_) {}
+    for (const node of path) if (node instanceof ShadowRoot) watchRoot(node);
+    return path.length && path[0] instanceof Element ? path[0] : e.target;
+  };
+  const onChange = (e) => {
+    if (firstTime(e)) emit(base('change', eventTarget(e), e));
+  };
   // The entries FormData would hold, without constructing one: the
   // constructor fires a `formdata` event the page's listeners would see.
   const formGetter = (name) => {
@@ -519,8 +530,9 @@ class BrowserCaptureMixin:
     }
     return entries;
   };
-  document.addEventListener('submit', (e) => {
-    const form = e.target;
+  const onSubmit = (e) => {
+    if (!firstTime(e)) return;
+    const form = eventTarget(e);
     if (!(form instanceof HTMLFormElement)) return;
     const data = {};
     try {
@@ -540,13 +552,37 @@ class BrowserCaptureMixin:
       ...base('form_submit', form, e), action: formAction(form), method: formMethod(form), data,
       submitter: e.submitter ? describe(e.submitter) : null
     });
-  }, listenerOptions);
-  if (CAPTURE_CLIPBOARD) {
-    document.addEventListener('paste', (e) => {
-      let text = '';
-      try { text = (e.clipboardData || window.clipboardData).getData('text') || ''; } catch (_) {}
-      emit({...base('paste', e.target, e), data: SAFE ? redact(text) : text.slice(0, 10000)});
+  };
+  if (INTERACTIONS) {
+    document.addEventListener('click', (e) => emit({...base('click', eventTarget(e), e), button: e.button, x: e.clientX, y: e.clientY}), listenerOptions);
+    document.addEventListener('change', onChange, listenerOptions);
+    const timers = new WeakMap();
+    document.addEventListener('input', (e) => {
+      const target = eventTarget(e);
+      if (!(target instanceof Element)) return;
+      clearTimeout(timers.get(target));
+      timers.set(target, setTimeout(() => emit(base('input', target, e)), 300));
     }, listenerOptions);
+    document.addEventListener('keydown', (e) => {
+      const key = e.key || '';
+      if (e.repeat || e.isComposing || key === 'Process' || key === 'Dead') return;
+      // AltGr reports Ctrl+Alt on Windows (AltGr+2 types "@"), and macOS
+      // Option+key types a character: only Ctrl/Meta combinations are shortcuts.
+      const altGraph = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
+      if (key.length <= 1 && (altGraph || (!e.ctrlKey && !e.metaKey))) return;
+      emit({...base('keydown', eventTarget(e), e), key, code: e.code, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey});
+    }, listenerOptions);
+    document.addEventListener('focusin', (e) => emit(base('focus', eventTarget(e), e)), listenerOptions);
+    document.addEventListener('submit', onSubmit, listenerOptions);
+    if (CAPTURE_CLIPBOARD) {
+      document.addEventListener('paste', (e) => {
+        let text = '';
+        try { text = (e.clipboardData || window.clipboardData).getData('text') || ''; } catch (_) {}
+        emit({...base('paste', eventTarget(e), e), data: SAFE ? redact(text) : text.slice(0, 10000)});
+      }, listenerOptions);
+    }
+    window.addEventListener('popstate', () => emit({event: 'popstate', ts: Date.now(), url: location.href}), listenerOptions);
+    window.addEventListener('hashchange', (e) => emit({event: 'hashchange', ts: Date.now(), url: location.href, oldURL: e.oldURL, newURL: e.newURL}), listenerOptions);
   }
   const dumpStorage = (factory) => {
     try {
@@ -583,19 +619,42 @@ class BrowserCaptureMixin:
       cookie: cookieState()
     });
   };
-  // No `unload` listener: `pagehide` fires in every case `unload` would, and
-  // an `unload` listener makes Chrome log a permissions-policy violation on
-  // the page and can keep the page out of the back/forward cache.
-  window.addEventListener('pagehide', () => flushState('pagehide'), listenerOptions);
-  window.addEventListener('freeze', () => flushState('freeze'), listenerOptions);
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushState('hidden');
-  }, listenerOptions);
-  window.addEventListener('popstate', () => emit({event: 'popstate', ts: Date.now(), url: location.href}), listenerOptions);
-  window.addEventListener('hashchange', (e) => emit({event: 'hashchange', ts: Date.now(), url: location.href, oldURL: e.oldURL, newURL: e.newURL}), listenerOptions);
+  if (STORAGE) {
+    // No `unload` listener: `pagehide` fires in every case `unload` would, and
+    // an `unload` listener makes Chrome log a permissions-policy violation on
+    // the page and can keep the page out of the back/forward cache.
+    window.addEventListener('pagehide', () => flushState('pagehide'), listenerOptions);
+    window.addEventListener('freeze', () => flushState('freeze'), listenerOptions);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushState('hidden');
+    }, listenerOptions);
+    // Cookies written by script (document.cookie, cookieStore.set) cause no
+    // network event: tell the logger to re-read the jar. Bursts collapse into
+    // one hint. cookieStore only exists in secure contexts; elsewhere the
+    // visible cookie string is compared once a second.
+    let hintTimer = null;
+    const cookieHint = (source) => {
+      if (hintTimer) return;
+      hintTimer = setTimeout(() => { hintTimer = null; emit({event: 'cookie_hint', ts: Date.now(), source}); }, 100);
+    };
+    if (window.cookieStore && typeof window.cookieStore.addEventListener === 'function') {
+      window.cookieStore.addEventListener('change', () => cookieHint('cookieStore'), listenerOptions);
+    } else {
+      let lastCookie = null;
+      const pollCookie = () => {
+        let current;
+        try { current = String(document.cookie || ''); } catch (_) { return; }
+        if (lastCookie !== null && current !== lastCookie) cookieHint('documentCookie');
+        lastCookie = current;
+      };
+      pollCookie();
+      const poller = setInterval(pollCookie, 1000);
+      controller.signal.addEventListener('abort', () => clearInterval(poller));
+    }
+  }
   window.addEventListener('beforeunload', () => {
-    emit({event: 'beforeunload', ts: Date.now(), url: location.href});
-    flushState('beforeunload');
+    if (INTERACTIONS && location.href !== 'about:blank') emit({event: 'beforeunload', ts: Date.now(), url: location.href});
+    if (STORAGE) flushState('beforeunload');
   }, listenerOptions);
 })();
 """
@@ -604,4 +663,6 @@ class BrowserCaptureMixin:
             .replace("__MARKER__", json.dumps(self.install_marker))
             .replace("__SAFE__", "true" if self.config.sensitive_mode == "safe" else "false")
             .replace("__CLIPBOARD__", "true" if self.config.capture_clipboard else "false")
+            .replace("__INTERACTIONS__", "true" if self.config.capture_interactions else "false")
+            .replace("__STORAGE__", "true" if self.config.capture_storage else "false")
         )

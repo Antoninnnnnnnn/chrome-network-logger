@@ -12,6 +12,12 @@ from .models import PendingCommand
 CLIENT_STORAGE_DEBOUNCE_SECONDS = 0.5
 
 
+# Debounced retries while waiting for a frame's isolated world.
+IDB_CONTEXT_ATTEMPTS = 3
+# A retry dropped elsewhere (no live page) must not count against a later dump.
+IDB_CONTEXT_WAIT_RESET_SECONDS = 60.0
+
+
 def storage_origin(url: str | None) -> str | None:
     """Return the origin a page's client storage is keyed by, if it has one."""
     parsed = urlsplit(str(url or ""))
@@ -172,8 +178,41 @@ class ClientStorageMixin:
             "awaitPromise": True,
         }
         context_id = self._isolated_context(session_id, origin)
-        if context_id is not None:
-            params["contextId"] = context_id
+        wait_key = (origin, database, store)
+        if context_id is None:
+            # Never read in the page's own world, where the page could observe
+            # or alter the read. The isolated world appears shortly after a
+            # navigation: try again a few times before giving up.
+            now = time.monotonic()
+            with self.state_lock:
+                attempts, since = self._idb_context_waits.get(wait_key, (0, now))
+                if now - since > IDB_CONTEXT_WAIT_RESET_SECONDS:
+                    attempts, since = 0, now
+                attempts += 1
+                self._idb_context_waits[wait_key] = (attempts, since)
+            if attempts <= IDB_CONTEXT_ATTEMPTS:
+                self.request_client_storage_dump(origin, "indexeddb", reason=reason, database=database, store=store)
+                return
+            with self.state_lock:
+                self._idb_context_waits.pop(wait_key, None)
+            self.stats["clientStorageSkipped"] += 1
+            self.store.write_jsonl(
+                "storage/indexeddb.jsonl",
+                {
+                    "time": self.timestamps.normalize(),
+                    "kind": "skipped",
+                    "origin": origin,
+                    "reason": reason,
+                    "database": database,
+                    "objectStore": store,
+                    "skipReason": "no isolated world for this origin; records are never read in the page's own world",
+                },
+                redact=True,
+            )
+            return
+        with self.state_lock:
+            self._idb_context_waits.pop(wait_key, None)
+        params["contextId"] = context_id
         self.send(
             "Runtime.evaluate",
             params,

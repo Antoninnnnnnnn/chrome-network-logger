@@ -159,6 +159,13 @@ class StateCaptureMixin:
         if isinstance(payload, dict) and payload.get("event") == "storage_state":
             self._storage_flush(session_id, params, payload)
             return
+        if isinstance(payload, dict) and payload.get("event") == "cookie_hint":
+            # A script wrote a cookie: no network event will say so.
+            self.stats["cookieHints"] += 1
+            self.request_cookie_sync(f"pageScript:{payload.get('source') or 'unknown'}")
+            return
+        if not self.config.capture_interactions:
+            return
         self._user_event(session_id, params)
 
     # ------------------------------------------------------------- web storage

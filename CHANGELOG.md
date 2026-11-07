@@ -4,6 +4,21 @@ All notable changes to Chrome Network Logger are documented here.
 
 ## Unreleased
 
+### Security and privacy
+
+- The proxy relay only serves the Chrome the logger launched: each connection is matched to the process that opened it, and other local processes — which could otherwise use the upstream proxy with your credentials — are refused and reported. Where processes cannot be inspected, the relay says so and accepts local connections.
+- The relay refuses origin-form requests and requests aimed at itself: a web page could make it connect to itself in a loop until no connection slot was left.
+- The selected proxy is checked before Chrome starts (reachable, TLS, credentials) without contacting any third-party host; `--no-proxy-check` skips it.
+- An upstream `407` becomes a `502` with an explanation: Chrome asked for a login in a loop that could never succeed. Unreachable upstreams and TLS failures are reported once (with the `--proxy-insecure-tls` hint) in the log and manifest warnings instead of at debug level.
+- IndexedDB is never read in the page's own world, where the page could observe or alter the read; with `--no-interactions` it used to be. A dump waits for the isolated world, then is recorded as `skipped`.
+- Safe mode also redacts: camelCase secret names (`authToken`, `userSecret`, `privateKey`), an application `sessionId` in Web Storage and IndexedDB, JSON stored inside strings, Socket.IO frames, URL-encoded values with harmless names (a JWT, a JSON document), JWTs in URL paths, text parts of multipart bodies, and the `urlFragment` field. Values under a sensitive name keep their structure; `Basic plan` is no longer redacted; URL parts that need no redaction keep their original text.
+
+### Capture
+
+- Events inside open shadow roots name the element actually used, and `change` and form submissions in shadow roots are captured.
+- Cookies written by page script (`document.cookie`, `cookieStore.set`) trigger a cookie-jar read, so they appear when they are written (`pageScript:` reasons, `stats.cookieHints`).
+- With `--no-interactions`, the isolated-world script is still installed for storage capture: page storage dumps on `pagehide`/`freeze`/hidden and script-written cookies were silently missing.
+
 ### Sessions easier to analyse
 
 - Write `reports/overview.md`, a bounded digest of the session: pages visited (with single-page-application route changes), HTTP errors, network failures, incomplete requests, console errors and uncaught exceptions, API endpoints grouped by method and path with identifiers collapsed, the requests that followed each click, submit, change or key press in the same tab, and hosts. Every row names the record `id` to look up. Its headline numbers are stored in `manifest.json` under `analysis`, shown in `INDEX.md`, and `INDEX.md` sends readers to the overview first.

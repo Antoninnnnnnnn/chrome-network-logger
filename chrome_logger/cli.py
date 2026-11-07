@@ -23,7 +23,7 @@ from .chrome import (
 )
 from .config import CaptureConfig
 from .managed_chrome import ManagedChrome, ManagedChromeError, ensure_managed_chrome
-from .proxy import build_proxy_route, load_proxies, select_proxy, start_toggle_keyboard
+from .proxy import ProxyCheckError, build_proxy_route, check_proxy, load_proxies, select_proxy, start_toggle_keyboard
 from .redaction import Redactor
 from .storage import CaptureStore
 
@@ -193,6 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--proxy-insecure-tls", action="store_true", help="Disable certificate verification for HTTPS upstream proxies"
     )
     parser.add_argument(
+        "--no-proxy-check",
+        action="store_true",
+        help="Skip the check that the proxy is reachable and accepts its credentials before Chrome starts",
+    )
+    parser.add_argument(
         "--keep-chrome", action="store_true", help="Leave the dedicated Chrome window open after capture"
     )
     parser.add_argument(
@@ -354,7 +359,15 @@ def main(argv: list[str] | None = None) -> int:
     proxies = load_proxies(Path(args.proxy_file).expanduser())
     try:
         proxy = select_proxy(proxies, args.proxy, prompt=args.proxy_prompt)
-        proxy_args, relay = build_proxy_route(proxy, verify_tls=not args.proxy_insecure_tls)
+        if proxy and not args.no_proxy_check:
+            # A proxy that is down or refuses its credentials would make every
+            # request of the capture fail: say so now, not in the results.
+            try:
+                check_proxy(proxy, verify_tls=not args.proxy_insecure_tls)
+            except ProxyCheckError as exc:
+                raise ValueError(f"{exc}. Fix proxy.txt, pick another proxy, or pass --no-proxy-check") from exc
+        # The relay holds the upstream credentials: it serves only the Chrome launched below.
+        proxy_args, relay = build_proxy_route(proxy, verify_tls=not args.proxy_insecure_tls, restrict_clients=True)
     except ValueError as exc:
         parser.error(str(exc))
     if args.keep_chrome and relay:
@@ -397,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
         LOG.warning(message)
         safe_warning(message)
 
+    if relay:
+        relay.on_problem = safe_warning
     if proxy:
         store.set_manifest(proxy={"enabled": True, "upstream": proxy.label(), "relay": bool(relay)})
         LOG.info("Proxy route enabled: %s", proxy.label())
@@ -440,6 +455,10 @@ def main(argv: list[str] | None = None) -> int:
         chrome = launch_chrome(chrome_path, profile_dir, port, [*proxy_args, "about:blank"])
         version = wait_for_cdp(chrome)
         port = chrome.port
+        if relay:
+            # Chrome now listens on its DevTools port, which proves its sockets
+            # can be inspected before the relay starts trusting that check.
+            relay.set_client_process(chrome.process.pid, listening_port=port)
         LOG.info("Connected to %s", version.get("Browser"))
         capture = CDPCapture(port, config, store)
         if not capture.connect():

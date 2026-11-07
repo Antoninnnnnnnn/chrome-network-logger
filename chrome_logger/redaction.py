@@ -8,7 +8,7 @@ import re
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, quote_plus, unquote_plus, urlsplit, urlunsplit
 
 # IDs emitted by CDP are correlation identifiers, not authentication secrets. They
 # must stay stable in canonical records. API/body payloads are redacted with
@@ -34,7 +34,7 @@ _SENSITIVE_KEY = re.compile(
     r"access[_-]?token|refresh[_-]?token|id[_-]?token|token|bearer|jwt|"
     r"session(?:[_-]?(?:token|key|secret|cookie|auth))?|"
     r"csrf|xsrf|otp|pin|cvv|cvc|cc|card(?:[_-]?(?:number|no|num))?|"
-    r"credit[_-]?card|credential|assertion|signature|sig|auth[_-]?code"
+    r"credit[_-]?card|credential|assertion|signature|sig|auth[_-]?code|private[_-]?key"
     r")(?:$|[_\-.])",
     re.IGNORECASE,
 )
@@ -94,6 +94,7 @@ _SENSITIVE_NORMALIZED_KEYS = {
     "signature",
     "sig",
     "authcode",
+    "privatekey",
 }
 
 _SENSITIVE_NORMALIZED_FRAGMENTS = {
@@ -114,7 +115,12 @@ _SENSITIVE_NORMALIZED_FRAGMENTS = {
     "cardnumber",
     "creditcard",
     "authcode",
+    "privatekey",
 }
+
+# Application data: a field called sessionId in there is the application's own
+# session, not a CDP correlation id.
+_APP_DATA_KEYS = {"values", "entries", "localstorage", "sessionstorage", "data", "newvalue", "oldvalue"}
 
 _URL_HEADERS = {"referer", "location", "content-location"}
 
@@ -136,12 +142,16 @@ _AUTH_VALUE = re.compile(r"(?i)(\b(?:bearer|basic)\s+)([A-Za-z0-9._~+/=-]+)")
 _JWT_VALUE = re.compile(
     r"(?<![A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,})(?![A-Za-z0-9_-])"
 )
-_KEY_VALUE = re.compile(
+_KEY_VALUE_NAMES = (
     r"(?i)(\b(?:password|passwd|pwd|secret|client[_-]?secret|access[_-]?token|"
     r"refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|csrf|xsrf|otp|pin|cvv|cvc|"
     r"card[_-]?(?:number|no|num)|credit[_-]?card|credential|assertion|jwt|auth[_-]?code)"
-    r"\b\s*[=:]\s*)([^&\s,;]+)"
+    r"\b\s*[=:]\s*)"
 )
+# A value already turned into a marker is never matched again.
+_KEY_VALUE = re.compile(_KEY_VALUE_NAMES + r"(?!<redacted)([^&\s,;]+)")
+# Inside serialized JSON a value must stop at the closing quote or an escape.
+_KEY_VALUE_IN_JSON = re.compile(_KEY_VALUE_NAMES + r'(?!<redacted)([^&\s,;"\\<]+)')
 _ALREADY_REDACTED = re.compile(
     r"^<redacted len=\d+(?: hmac=[0-9a-f]{8,64}| source=browser)?>$",
     re.IGNORECASE,
@@ -157,6 +167,43 @@ _HTML_SENSITIVE_ATTRIBUTE = re.compile(
     r"(?i)(\b(?:value|srcdoc)\s*=\s*)(?P<quote>[\"']?)(?P<value>.*?)(?P=quote)(?=\s|/?>)",
     re.DOTALL,
 )
+
+
+_CAMEL_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+")
+# camelCase names whose last word, or last two words, name a secret:
+# authToken, userSecret, csrfToken, privateKey. Only the end counts, so
+# tokenType, sessionStorage or accessTokenExpiresAt stay readable.
+_CAMEL_SECRET_LAST = {"token", "secret", "password", "passwd", "pwd", "credential", "credentials", "jwt", "cookie"}
+_CAMEL_SECRET_PAIRS = {
+    ("secret", "key"),
+    ("private", "key"),
+    ("api", "key"),
+    ("access", "key"),
+    ("signing", "key"),
+    ("encryption", "key"),
+}
+# Field names that carry no data themselves (expiresAt, user_id, roles).
+_ORDINARY_KEY = re.compile(r"^[a-z]+(?:[_-][a-z]+|[A-Z][a-z]+)*$")
+# A JSON document behind a numeric prefix: Socket.IO/Engine.IO frames ("42[...]").
+_PREFIXED_JSON = re.compile(r"^\s*(\d{1,4})\s*([\[{].*)$", re.DOTALL)
+_MAX_EMBEDDED_JSON = 1024 * 1024
+
+
+def _credential_like(token: str) -> bool:
+    """Tell a credential after Basic/Bearer from an ordinary word ("Basic plan", "Basic Membership")."""
+    if len(token) < 4:
+        return False
+    ordinary_word = token.isalpha() and len(token) <= 12 and (token.islower() or token.istitle())
+    return not ordinary_word
+
+
+def _camel_secret(key: str) -> bool:
+    if not re.search(r"[a-z0-9][A-Z]", key):
+        return False
+    words = [word.casefold() for word in _CAMEL_WORDS.findall(key)]
+    if len(words) < 2:
+        return False
+    return words[-1] in _CAMEL_SECRET_LAST or (words[-2], words[-1]) in _CAMEL_SECRET_PAIRS
 
 
 def _normalized_key(key: Any) -> str:
@@ -180,6 +227,7 @@ def _is_sensitive_key(key: Any, *, preserve_protocol_ids: bool = True) -> bool:
     text = str(key)
     return (
         bool(_SENSITIVE_KEY.search(text))
+        or _camel_secret(text)
         or normalized in _SENSITIVE_NORMALIZED_KEYS
         or any(fragment in normalized for fragment in _SENSITIVE_NORMALIZED_FRAGMENTS)
     )
@@ -257,20 +305,49 @@ class Redactor:
         return self.object({str(key): value}, preserve_protocol_ids=False)[str(key)]
 
     def _redact_parameters(self, value: str) -> str:
+        """Redact ``a=b&c=d`` pairs; pieces that need no change keep their exact original text."""
+        if not value:
+            return value
         try:
-            items = parse_qsl(value, keep_blank_values=True)
-            if not items:
-                return value
-            redacted = [
-                (
-                    key,
-                    str(self.value(item)) if _is_sensitive_url_parameter(key) else item,
-                )
-                for key, item in items
-            ]
-            return urlencode(redacted, doseq=True)
+            pieces = []
+            for piece in value.split("&"):
+                name, separator, raw = piece.partition("=")
+                if not separator:
+                    # A bare piece can be a whole token: "?<jwt>".
+                    bare = unquote_plus(piece)
+                    clean = self.text(bare)
+                    pieces.append(piece if clean == bare else quote_plus(clean))
+                    continue
+                decoded = unquote_plus(raw)
+                if _is_sensitive_url_parameter(unquote_plus(name)):
+                    clean = str(self.value(decoded))
+                else:
+                    # Harmless names can still carry a JWT, a JSON document
+                    # with a token, or a SAML response.
+                    clean = self.text(decoded)
+                    if clean == decoded:
+                        pieces.append(piece)
+                        continue
+                pieces.append(name + "=" + quote_plus(clean))
+            return "&".join(pieces)
         except Exception:
             return self.text(value)
+
+    def _redact_fragment(self, fragment: str) -> str:
+        """OAuth implicit-flow and hash-router fragments carry access_token/code/state parameters."""
+        prefix = "#" if fragment.startswith("#") else ""
+        body = fragment[len(prefix) :]
+        fragment_path, question, fragment_query = body.partition("?")
+        if question and "=" not in fragment_path:
+            # A hash route with parameters: "#/cb?code=...".
+            body = fragment_path + "?" + self._redact_parameters(fragment_query)
+        elif "=" in body:
+            # Parameters straight after "#", whose values may contain "?":
+            # "#access_token=...&redirect=/x?y=1".
+            body = self._redact_parameters(body)
+        else:
+            body = self.text(body)
+        return prefix + body
 
     def url(self, url: str | None) -> str | None:
         if not self.enabled or not url:
@@ -280,16 +357,9 @@ class Redactor:
             if parts.scheme.casefold() in {"data", "javascript"}:
                 return str(self.value(url))
             query = self._redact_parameters(parts.query)
-            fragment = parts.fragment
-            # OAuth implicit-flow and callback fragments often contain
-            # access_token/code/state parameters.
-            if "?" in fragment:
-                fragment_path, _, fragment_query = fragment.partition("?")
-                fragment = fragment_path + "?" + self._redact_parameters(fragment_query)
-            elif "=" in fragment:
-                fragment = self._redact_parameters(fragment)
-            else:
-                fragment = self.text(fragment)
+            fragment = self._redact_fragment(parts.fragment)
+            # Magic links and share URLs put JWTs in the path itself.
+            path = _JWT_VALUE.sub(lambda match: quote(str(self.value(match.group(1))), safe=""), parts.path)
 
             username = parts.username
             password = parts.password
@@ -304,7 +374,7 @@ class Redactor:
                 userinfo += "@"
             port = f":{parts.port}" if parts.port else ""
             netloc = f"{userinfo}{host}{port}"
-            return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+            return urlunsplit((parts.scheme, netloc, path, query, fragment))
         except Exception:
             return self.text(url)
 
@@ -325,7 +395,7 @@ class Redactor:
             and _is_sensitive_key(parent_key, preserve_protocol_ids=preserve_protocol_ids)
             and not cookie_context
         ):
-            return self.value(value)
+            return self._redact_leaves(value)
 
         if isinstance(value, dict):
             cookie_object = cookie_context or _looks_like_cookie(value)
@@ -349,7 +419,7 @@ class Redactor:
                     "urlfragment",
                     "requesturl",
                 } and isinstance(item, str):
-                    out[key_s] = self.url(item) if normalized != "urlfragment" else self._redact_parameters(item)
+                    out[key_s] = self.url(item) if normalized != "urlfragment" else self._redact_fragment(item)
                 elif cookie_object and normalized == "value":
                     out[key_s] = self.value(item)
                 elif normalized == "cookieline":
@@ -361,8 +431,10 @@ class Redactor:
                         parent_key=key_s,
                         preserve_protocol_ids=preserve_protocol_ids,
                     )
+                elif normalized in _APP_DATA_KEYS:
+                    out[key_s] = self.object(item, parent_key=key_s, preserve_protocol_ids=False)
                 elif _is_sensitive_key(key_s, preserve_protocol_ids=preserve_protocol_ids):
-                    out[key_s] = self.value(item)
+                    out[key_s] = self._redact_leaves(item)
                 else:
                     out[key_s] = self.object(
                         item,
@@ -382,16 +454,81 @@ class Redactor:
             return self.text(value)
         return copy.deepcopy(value)
 
+    def _redact_leaves(self, value: Any) -> Any:
+        """Everything under a sensitive name is secret, but its shape is useful: keep field names and nesting.
+
+        A key that is not an ordinary field name ({"sk_live_...": true}) is itself a secret.
+        """
+        if isinstance(value, dict):
+            return {
+                (str(key) if _ORDINARY_KEY.match(str(key)) and len(str(key)) <= 40 else str(self.value(key))): (
+                    self._redact_leaves(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._redact_leaves(item) for item in value]
+        if value is None or isinstance(value, bool):
+            return value
+        return self.value(value)
+
+    def _embedded_json(self, text: str) -> str | None:
+        """Redact a string that is itself JSON, or JSON behind a numeric prefix (Socket.IO)."""
+        stripped = text.strip()
+        if not stripped or len(stripped) > _MAX_EMBEDDED_JSON:
+            return None
+        prefix = ""
+        if stripped[0] not in "[{":
+            match = _PREFIXED_JSON.match(stripped)
+            if not match:
+                return None
+            prefix, stripped = match.group(1), match.group(2)
+        if stripped[-1] not in "]}":
+            return None
+        try:
+            parsed = json.loads(stripped)
+            if not isinstance(parsed, (dict, list)):
+                return None
+            original = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+            clean = self._scan(
+                json.dumps(self.object(parsed, preserve_protocol_ids=False), ensure_ascii=False, separators=(",", ":")),
+                structured=True,
+            )
+        except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+            # RecursionError: deeply nested JSON is left to the text patterns.
+            return None
+        return prefix + clean if clean != original else text
+
     def text(self, text: str) -> str:
         if not self.enabled:
             return text
-        result = _RAW_HEADER_LINE.sub(
-            lambda match: match.group("name") + str(self.value(match.group("value"))),
-            text,
+        embedded = self._embedded_json(text)
+        if embedded is not None:
+            return embedded
+        return self._scan(text, structured=False)
+
+    def _scan(self, text: str, *, structured: bool) -> str:
+        """Pattern passes over free text. ``structured`` text is serialized JSON whose values are already
+        redacted: the passes then only catch secrets inside keys, with patterns that stop at quotes so the
+        JSON stays valid."""
+        if structured:
+            result = text
+        else:
+            result = _RAW_HEADER_LINE.sub(
+                lambda match: match.group("name") + str(self.value(match.group("value"))),
+                text,
+            )
+        result = _AUTH_VALUE.sub(
+            lambda match: (
+                match.group(1) + str(self.value(match.group(2))) if _credential_like(match.group(2)) else match.group(0)
+            ),
+            result,
         )
-        result = _AUTH_VALUE.sub(lambda match: match.group(1) + str(self.value(match.group(2))), result)
         result = _JWT_VALUE.sub(lambda match: str(self.value(match.group(1))), result)
-        result = _KEY_VALUE.sub(lambda match: match.group(1) + str(self.value(match.group(2))), result)
+        key_value = _KEY_VALUE_IN_JSON if structured else _KEY_VALUE
+        result = key_value.sub(lambda match: match.group(1) + str(self.value(match.group(2))), result)
+        if structured:
+            return result
         result = _JSON_SECRET.sub(
             lambda match: match.group(1) + str(self.value(match.group(2))) + match.group(3),
             result,
@@ -425,15 +562,20 @@ class Redactor:
                 continue
             headers, body = chunk.split(separator, 1)
             match = disposition.search(headers)
+            trailing = ""
+            while body.endswith(("\r", "\n")):
+                trailing = body[-1] + trailing
+                body = body[:-1]
             if match and _is_sensitive_key(
                 (match.group(1) or match.group(2) or "").strip(), preserve_protocol_ids=False
             ):
-                trailing = ""
-                while body.endswith(("\r", "\n")):
-                    trailing = body[-1] + trailing
-                    body = body[:-1]
-                body = str(self.value(body)) + trailing
-            output.append(delimiter + headers + separator + body)
+                body = str(self.value(body))
+            elif not re.search(r"(?im)^Content-Disposition:[^\r\n]*\bfilename\*?=", headers):
+                # A text field with a harmless name (a GraphQL "operations"
+                # part) can still hold credentials. File parts stay as sent.
+                part_type = re.search(r"(?im)^Content-Type:\s*([^\r\n;]+)", headers)
+                body = self.body_text(body, part_type.group(1) if part_type else "text/plain")
+            output.append(delimiter + headers + separator + body + trailing)
         return "".join(output)
 
     def body_text(self, text: str, content_type: str | None = None) -> str:
@@ -444,10 +586,13 @@ class Redactor:
         if "json" in ctype or stripped.startswith(("{", "[")):
             try:
                 parsed = json.loads(text)
-                return json.dumps(
-                    self.object(parsed, preserve_protocol_ids=False),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
+                return self._scan(
+                    json.dumps(
+                        self.object(parsed, preserve_protocol_ids=False),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    structured=True,
                 )
             except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
                 # RecursionError: absurdly nested JSON falls back to text redaction.

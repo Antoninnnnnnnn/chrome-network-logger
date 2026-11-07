@@ -91,7 +91,7 @@ Options importantes :
 | `--max-body-mb 32` | Taille stockée maximale par body ; `0` = illimité |
 | `--max-session-body-mb 2048` | Total maximal de bodies uniques stockés par session ; `0` = illimité |
 | `--sensitive raw\|safe` | `raw` (défaut) conserve les valeurs telles quelles ; `safe` les masque |
-| `--no-interactions` | Désactive clics, inputs, formulaires et navigation SPA injectée |
+| `--no-interactions` | Désactive clics, inputs, formulaires et navigation SPA injectée (le script du monde isolé reste pour la capture du stockage, sauf avec `--no-storage`) |
 | `--capture-clipboard` | Capture les collages ; masqués en mode `safe` |
 | `--no-console` | Désactive console, exceptions et domaine `Log` |
 | `--no-storage` | Désactive snapshots cookies/localStorage/sessionStorage |
@@ -107,6 +107,7 @@ Options importantes :
 | `--duration SECONDES` | Arrête et finalise automatiquement ; valeur finie et positive ou nulle |
 | `--start-url URL` | Page initiale, ouverte seulement une fois le premier onglet instrumenté pour capturer ses premières requêtes ; `about:blank` par défaut |
 | `--proxy N\|random\|none` | Active explicitement un proxy ; `none`/connexion directe par défaut |
+| `--no-proxy-check` | Saute la vérification, avant le lancement de Chrome, que le proxy répond et accepte ses identifiants |
 | `--chrome-path PATH` | Chemin Chrome/Chromium explicite |
 | `--managed-chrome-dir PATH` | Emplacement du Chrome Stable officiel géré par l’outil |
 | `--no-download-chrome` | Refuse le téléchargement automatique si Chrome est absent |
@@ -240,6 +241,10 @@ Pour les proxies HTTP/HTTPS et SOCKS5 authentifiés, Chrome se connecte à un re
 Les proxies SOCKS4/SOCKS5 sans authentification sont passés directement à Chrome. SOCKS4 avec authentification est refusé avec une erreur claire. La validation TLS d'un proxy HTTPS reste active, sauf option explicite `--proxy-insecure-tls`. Dès qu'un proxy est choisi, Chrome reçoit aussi `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, pour qu'une page ne puisse pas découvrir l'adresse réelle via WebRTC/STUN.
 
 La présence de `proxy.txt` n’active jamais un proxy à elle seule : le routage reste direct tant qu’un sélecteur explicite n’est pas fourni. Le relay borne aussi le nombre de connexions simultanées et répond `503` en cas de saturation.
+
+Avant le lancement de Chrome, le proxy choisi est vérifié : injoignable, échec TLS ou identifiants refusés (`407`, ou refus du login SOCKS5) arrêtent le logger avec un message clair. La vérification ne contacte aucun hôte tiers — on demande à un proxy HTTP(S) un `CONNECT` vers son propre port discard local — et `--no-proxy-check` la désactive.
+
+Le relay porte les identifiants du proxy amont : il ne sert donc que le Chrome lancé par le logger. Chaque connexion est rattachée au processus qui l'a ouverte, et les autres processus locaux sont refusés (consigné en avertissement). Si les processus ne peuvent pas être inspectés (navigateur en bac à sable), il le signale et accepte les connexions locales. Il refuse les requêtes en forme origine et celles qui le visent lui-même. Un `407` du proxy amont devient un `502` explicatif au lieu d'atteindre Chrome, qui redemanderait sinon un login en boucle ; les échecs du proxy amont sont consignés une fois dans les avertissements du manifest.
 
 ## Fiabilité et limites CDP
 

@@ -96,6 +96,8 @@ class CDPCapture(
         self._setup_acks: set[tuple[str, str]] = set()
         self._client_storage_requests: dict[tuple[str, str, str | None, str | None, str | None], str] = {}
         self._client_storage_earliest = 0.0
+        # IndexedDB dumps waiting for the frame's isolated world to exist.
+        self._idb_context_waits: dict[tuple[str, str, str], tuple[int, float]] = {}
         self.stats = {
             "requests": 0,
             "responses": 0,
@@ -125,6 +127,7 @@ class CDPCapture(
             "cacheEntries": 0,
             "clientStorageErrors": 0,
             "clientStorageSkipped": 0,
+            "cookieHints": 0,
             "degradedSessions": 0,
         }
 
@@ -558,7 +561,10 @@ class CDPCapture(
                         time.monotonic(),
                     ),
                 )
-            if self.config.capture_interactions:
+            if self._page_script_enabled():
+                # Also installed for storage alone: it flushes storage when a
+                # page goes away, reports cookies written by script, and gives
+                # IndexedDB reads an isolated world.
                 script = self._interaction_script()
                 self.send(
                     "Runtime.addBinding",
@@ -1201,9 +1207,12 @@ class CDPCapture(
         methods = {"Network.enable", "Runtime.enable", "Page.enable"}
         if self.config.body_mode != "none" and self.config.intercept_bodies != "none":
             methods.add("Fetch.enable")
-        if self.config.capture_interactions:
+        if self._page_script_enabled():
             methods.add("Page.addScriptToEvaluateOnNewDocument")
         return methods
+
+    def _page_script_enabled(self) -> bool:
+        return self.config.capture_interactions or self.config.capture_storage
 
     def open_start_url(self, url: str, timeout: float = 10.0) -> bool:
         """Load the start URL in the first tab once that tab is fully instrumented.
@@ -1332,7 +1341,7 @@ class CDPCapture(
                     self._send_quiesce("Fetch.disable", {}, session_id)
                 if self.config.capture_storage:
                     self._send_quiesce("DOMStorage.disable", {}, session_id)
-                if self.config.capture_interactions:
+                if self._page_script_enabled():
                     for context_id in interaction_contexts.get(session_id, set()):
                         self._send_quiesce(
                             "Runtime.evaluate",

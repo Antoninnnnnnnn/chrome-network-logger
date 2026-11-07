@@ -24,7 +24,9 @@ Web pages, response bodies, CDP events, proxy servers, captured text, Chrome for
 - Required CDP command, writer, or shutdown failures cause an error/partial manifest and, for fatal failures, a non-zero exit code.
 - Chrome uses a dedicated profile; stale locks are removed only after confirming no Chrome process still references it. Processes are matched on the exact `--user-data-dir` path, never on a substring, so another profile's browser is never stopped.
 - Chrome is closed with the DevTools `Browser.close` command so it flushes its profile; signals and a hard kill are only fallbacks.
-- Web Storage snapshots are read through CDP (`DOMStorage.getDOMStorageItems`) and IndexedDB dumps run in the isolated world of the matching origin, so the page cannot observe them; IndexedDB reads never create, upgrade or block a database.
+- Web Storage snapshots are read through CDP (`DOMStorage.getDOMStorageItems`) and IndexedDB dumps run only in the isolated world of the matching origin — never in the page's own world; a dump with no such world is retried, then recorded as `skipped` — so the page cannot observe them; IndexedDB reads never create, upgrade or block a database.
+- The proxy relay listens on loopback only and serves only connections opened by the launched Chrome's processes (matched through the operating system's socket table); it refuses origin-form requests and requests to itself, and never forwards an upstream `407`. Where the socket owner cannot be determined, it records that it accepts any local process.
+- The selected proxy is checked before launch without contacting any third-party host.
 - A non-zero ephemeral loopback CDP port avoids Chrome's port-0 `navigator.webdriver` marker; the returned browser endpoint must still match that exact loopback port.
 - The managed fallback accepts only Google's fixed HTTPS metadata/storage hosts and exact Stable archive layout, requires TLS 1.2+, bounds compressed and expanded data, rejects unsafe ZIP paths/types, and publishes an extracted version atomically.
 - Managed download details plus locally computed archive/executable SHA-256 values are recorded, and the executable is rechecked before reuse; automatic download can be disabled with `--no-download-chrome`.
@@ -38,6 +40,7 @@ Web pages, response bodies, CDP events, proxy servers, captured text, Chrome for
 - Chrome/CDP may omit multipart file bytes, redirect bodies, WebTransport payloads, WebRTC traffic, or large/streaming bodies.
 - A hostile local administrator or compromised Chrome/Python/runtime is outside this project's protection boundary.
 - `--proxy-insecure-tls` intentionally disables upstream proxy certificate verification.
+- Proxy credentials are read from `proxy.txt` in clear text; any process running as the same user can read that file regardless of the relay's access check.
 - The managed archive API currently provides download URLs rather than publisher SHA-256 values. The recorded executable SHA-256 detects later cache changes, while initial publisher authenticity depends on the operating system TLS trust store and Google's HTTPS endpoints.
 - Using a genuine, non-headless Chrome without WebDriver removes framework-specific markers but does not make CDP use or a fresh environment impossible to fingerprint.
 

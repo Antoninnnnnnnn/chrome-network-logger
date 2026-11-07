@@ -6,6 +6,7 @@ import ipaddress
 import logging
 import os
 import random
+import re
 import selectors
 import socket
 import ssl
@@ -15,7 +16,10 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlsplit
+
+import psutil
 
 LOG = logging.getLogger(__name__)
 _ALLOWED_SCHEMES = {"http", "https", "socks4", "socks5"}
@@ -24,6 +28,180 @@ _CONNECTION_ESTABLISHED = b"HTTP/1.1 200 Connection established\r\n\r\n"
 _TUNNEL_CHUNK = 64 * 1024
 _TUNNEL_POLL_SECONDS = 1.0
 _KEY_POLL_SECONDS = 0.1
+_REJECTED_CREDENTIALS = re.compile(rb"HTTP/1\.[01] 407\b")
+_LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1", "[::1]"}
+_RELAY_HOST = "127.0.0.1"
+
+
+def _response(status: str, message: str) -> bytes:
+    body = (message + "\n").encode("utf-8")
+    return (
+        f"HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    ).encode("latin-1") + body
+
+
+def _status_code(response_head: bytes) -> int | None:
+    try:
+        return int(response_head.split(b"\r\n", 1)[0].split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+class UpstreamError(ConnectionError):
+    """The upstream proxy itself could not be reached or negotiated with (not a destination failure)."""
+
+
+class ProxyCheckError(ValueError):
+    """The selected proxy cannot be used; raised before Chrome is launched."""
+
+
+def _tcp_connections(process: psutil.Process) -> list[Any]:
+    listing = getattr(process, "net_connections", None) or process.connections
+    return list(listing(kind="tcp"))
+
+
+def _process_tree(root_pid: int) -> list[psutil.Process]:
+    root = psutil.Process(root_pid)
+    return [root, *root.children(recursive=True)]
+
+
+def _connection_owner(
+    root_pid: int,
+    peer: tuple[str, int],
+    relay: tuple[str, int],
+    hint: psutil.Process | None = None,
+) -> tuple[bool | None, psutil.Process | None]:
+    """Find the process of Chrome's tree that owns the client end of a relay connection.
+
+    The socket must match on both ends, addresses included: a process bound to
+    127.0.0.2 with the same port number as one of Chrome's sockets is not Chrome.
+    Returns (True, process) on a match, (False, None) when every process of the
+    tree was inspected and none owns it, and (None, None) when that cannot be
+    decided (Chrome is gone, or some of its processes may not be inspected).
+    """
+    peer_ip, peer_port = peer
+    relay_ip, relay_port = relay
+
+    def owns(process: psutil.Process) -> bool:
+        for connection in _tcp_connections(process):
+            local, remote = connection.laddr, connection.raddr
+            if (
+                local
+                and remote
+                and local.port == peer_port
+                and local.ip == peer_ip
+                and remote.port == relay_port
+                and remote.ip == relay_ip
+            ):
+                return True
+        return False
+
+    if hint is not None:
+        # Chrome's network service owns every socket: usually one call.
+        # is_running() also notices a PID reused by another process.
+        try:
+            if hint.is_running() and owns(hint):
+                return True, hint
+        except psutil.Error:
+            pass
+    try:
+        processes = _process_tree(root_pid)
+    except psutil.Error:
+        return None, None
+    denied = False
+    for process in processes:
+        try:
+            if owns(process):
+                return True, process
+        except psutil.AccessDenied:
+            denied = True
+        except psutil.Error:
+            continue
+    return (None, None) if denied else (False, None)
+
+
+def _tree_is_listening(root_pid: int, port: int) -> bool:
+    """Whether a process of Chrome's tree is seen listening on ``port`` (its DevTools port)."""
+    try:
+        processes = _process_tree(root_pid)
+    except psutil.Error:
+        return False
+    for process in processes:
+        try:
+            if any(
+                connection.status == psutil.CONN_LISTEN and connection.laddr and connection.laddr.port == port
+                for connection in _tcp_connections(process)
+            ):
+                return True
+        except psutil.Error:
+            continue
+    return False
+
+
+def check_proxy(proxy: ProxySpec, *, verify_tls: bool = True, timeout: float = 10.0) -> None:
+    """Fail fast, before Chrome starts, on a proxy that cannot work: unreachable, TLS or credentials refused.
+
+    No third-party host is contacted: an HTTP(S) proxy is asked to CONNECT to its own loopback discard
+    port, which a proxy refuses or fails, but answers 407 only when the credentials are wrong or missing.
+    SOCKS5 stops after authentication. Anything else (403, 502, a closed connection) is not proof of a
+    problem and passes.
+    """
+    target = f"{proxy.host}:{proxy.port}"
+    try:
+        raw = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
+    except OSError as exc:
+        raise ProxyCheckError(f"Cannot reach the proxy {target}: {exc}") from exc
+    sock: socket.socket = raw
+    try:
+        sock.settimeout(timeout)
+        if proxy.scheme == "https":
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            if not verify_tls:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            try:
+                sock = context.wrap_socket(raw, server_hostname=proxy.host)
+            except ssl.SSLError as exc:
+                hint = "; use --proxy-insecure-tls if it uses a self-signed certificate" if verify_tls else ""
+                raise ProxyCheckError(f"TLS handshake with the proxy {target} failed: {exc}{hint}") from exc
+        if proxy.scheme == "socks5":
+            methods = [_SOCKS5_NO_AUTH] if proxy.username is None else [_SOCKS5_NO_AUTH, _SOCKS5_USER_PASS]
+            sock.sendall(bytes([_SOCKS5_VERSION, len(methods), *methods]))
+            try:
+                version, method = _recv_exact(sock, 2)
+                if version != _SOCKS5_VERSION:
+                    raise SocksError(f"it did not answer as a SOCKS5 proxy (version byte {version:#04x})")
+                if method == _SOCKS5_NO_ACCEPTABLE_METHOD:
+                    raise SocksError("it requires credentials" if proxy.username is None else "it refused the login")
+                if method == _SOCKS5_USER_PASS and proxy.username is not None:
+                    _socks5_authenticate(sock, proxy.username, proxy.password or "")
+            except SocksError as exc:
+                raise ProxyCheckError(f"SOCKS5 proxy {target}: {exc}") from exc
+            return
+        if proxy.scheme in {"http", "https"}:
+            lines = [b"CONNECT 127.0.0.1:9 HTTP/1.1", b"Host: 127.0.0.1:9"]
+            if proxy.authorization_header:
+                lines.append(f"Proxy-Authorization: {proxy.authorization_header}".encode("latin-1"))
+            sock.sendall(b"\r\n".join(lines) + b"\r\n\r\n")
+            try:
+                head = _read_headers(sock)
+            except OSError:
+                return
+            if _status_code(head) == 407:
+                reason = "rejected the credentials" if proxy.has_auth else "requires credentials"
+                raise ProxyCheckError(f"The proxy {target} {reason} (HTTP 407)")
+    except ProxyCheckError:
+        raise
+    except OSError as exc:
+        raise ProxyCheckError(f"The proxy {target} failed during the check: {exc}") from exc
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
 
 _SOCKS5_VERSION = 0x05
 _SOCKS5_NO_AUTH = 0x00
@@ -396,6 +574,7 @@ class ProxyRelay:
         connect_timeout: float = 15.0,
         verify_tls: bool = True,
         max_connections: int = 512,
+        restrict_clients: bool = False,
     ):
         if upstream.scheme not in _RELAY_SCHEMES:
             raise ValueError("ProxyRelay supports HTTP, HTTPS and SOCKS5 upstream proxies only")
@@ -412,11 +591,92 @@ class ProxyRelay:
         self._stop = threading.Event()
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind(("127.0.0.1", 0))
+        self._server.bind((_RELAY_HOST, 0))
         self._server.listen(256)
         self._server.settimeout(0.5)
         self.local_port = int(self._server.getsockname()[1])
         self._thread = threading.Thread(target=self._accept_loop, name="proxy-relay", daemon=True)
+        # The relay carries the upstream credentials: when restricted, it only
+        # serves processes of the Chrome started by the logger.
+        self.restrict_clients = restrict_clients
+        self._client_root_pid: int | None = None
+        self._client_ready = threading.Event()
+        self._owner_hint: psutil.Process | None = None
+        self._verification_off = False
+        self._problems: dict[str, int] = {}
+        self.on_problem: Callable[[str], None] | None = None
+
+    def set_client_process(self, pid: int, *, listening_port: int | None = None) -> None:
+        """Serve only connections opened by ``pid`` or one of its child processes (the launched Chrome).
+
+        ``listening_port`` is a port Chrome is known to listen on (its DevTools
+        port). If no process of the tree is seen listening there, this system
+        does not let the logger inspect Chrome's sockets (sandboxed or
+        namespaced browser): checking is then turned off, and said so, instead
+        of refusing Chrome itself. The decision depends on Chrome alone, never
+        on connections another process could open.
+        """
+        self._client_root_pid = int(pid)
+        if listening_port is not None and not _tree_is_listening(self._client_root_pid, listening_port):
+            self._verification_off = True
+            self._report(
+                "cannot see the sockets of the captured Chrome on this system; "
+                "the relay accepts connections from any local process"
+            )
+        self._client_ready.set()
+
+    @property
+    def problems(self) -> dict[str, int]:
+        """Distinct problems seen so far, with how many times each occurred."""
+        with self._state_lock:
+            return dict(self._problems)
+
+    def _report(self, message: str) -> None:
+        with self._state_lock:
+            first = message not in self._problems
+            self._problems[message] = self._problems.get(message, 0) + 1
+        if not first:
+            return
+        LOG.warning("Proxy relay: %s", message)
+        callback = self.on_problem
+        if callback is not None:
+            try:
+                callback(f"Proxy relay: {message}")
+            except Exception:
+                LOG.debug("Proxy problem callback failed", exc_info=True)
+
+    def _client_allowed(self, client: socket.socket) -> bool:
+        if not self.restrict_clients:
+            return True
+        # Chrome may connect before the logger has its process id; wait for it.
+        if not self._client_ready.wait(timeout=30) or self._client_root_pid is None:
+            return False
+        if self._verification_off:
+            return True
+        try:
+            peer_ip, peer_port = client.getpeername()[:2]
+        except OSError:
+            return False
+        owned, process = _connection_owner(
+            self._client_root_pid, (str(peer_ip), int(peer_port)), (_RELAY_HOST, self.local_port), self._owner_hint
+        )
+        if owned:
+            with self._state_lock:
+                self._owner_hint = process
+            return True
+        if owned is None:
+            # Undecidable because of Chrome's own processes, not because of the
+            # client: refusing would break the capture.
+            self._report(
+                "some of Chrome's processes cannot be inspected; connections that cannot be matched are accepted"
+            )
+            return True
+        self._report("refused connections from a local process that is not the captured Chrome")
+        return False
+
+    @staticmethod
+    def _is_relay_itself(host: str, port: int, local_port: int) -> bool:
+        return host.casefold() in _LOOPBACK_NAMES and port == local_port
 
     @property
     def enabled(self) -> bool:
@@ -504,7 +764,11 @@ class ProxyRelay:
             LOG.debug("Socket close ignored: %s", exc)
 
     def _connect_upstream(self) -> socket.socket:
-        raw = socket.create_connection((self.upstream.host, self.upstream.port), timeout=self.connect_timeout)
+        label = self.upstream.label()
+        try:
+            raw = socket.create_connection((self.upstream.host, self.upstream.port), timeout=self.connect_timeout)
+        except OSError as exc:
+            raise UpstreamError(f"cannot reach the upstream proxy {label}: {exc}") from exc
         if self.upstream.scheme == "https":
             try:
                 context = ssl.create_default_context()
@@ -513,10 +777,29 @@ class ProxyRelay:
                     context.check_hostname = False
                     context.verify_mode = ssl.CERT_NONE
                 return context.wrap_socket(raw, server_hostname=self.upstream.host)
+            except ssl.SSLError as exc:
+                self._close_socket(raw)
+                hint = "; use --proxy-insecure-tls for a self-signed certificate" if self.verify_tls else ""
+                raise UpstreamError(f"TLS handshake with the upstream proxy {label} failed: {exc}{hint}") from exc
             except Exception:
                 self._close_socket(raw)
                 raise
         return raw
+
+    def _refuse_rejected_credentials(self, client: socket.socket) -> None:
+        # Forwarding the 407 would make Chrome ask the user for a login it
+        # cannot use: the relay sends its own credentials, again and again.
+        self._report(f"the upstream proxy {self.upstream.label()} rejected the credentials (HTTP 407)")
+        client.sendall(_response("502 Bad Gateway", "The upstream proxy rejected the configured credentials."))
+
+    def _screen_rejected_credentials(self, client: socket.socket) -> Callable[[bytes], bool]:
+        def screen(first_chunk: bytes) -> bool:
+            if _REJECTED_CREDENTIALS.match(first_chunk):
+                self._refuse_rejected_credentials(client)
+                return False
+            return True
+
+        return screen
 
     def _connect_socks5(self, host: str, port: int) -> socket.socket:
         sock = socket.create_connection((self.upstream.host, self.upstream.port), timeout=self.connect_timeout)
@@ -538,6 +821,8 @@ class ProxyRelay:
         # After "200 Connection established" a 502 would be injected into the tunneled stream: just close.
         tunnel_started = False
         try:
+            if not self._client_allowed(client):
+                return
             raw = _read_headers(client)
             if b"\r\n\r\n" not in raw:
                 return
@@ -554,6 +839,10 @@ class ProxyRelay:
             via_http_proxy = use_upstream and self.upstream.scheme != "socks5"
 
             if method.upper() == b"CONNECT":
+                connect_host, connect_port = _split_authority(target, 443)
+                if self._is_relay_itself(connect_host, connect_port, self.local_port):
+                    client.sendall(_response("508 Loop Detected", "The relay does not tunnel to itself."))
+                    return
                 if via_http_proxy:
                     upstream = self._connect_upstream()
                     self._track(upstream)
@@ -579,6 +868,9 @@ class ProxyRelay:
                         status = int(status_line.split(b" ", 2)[1])
                     except Exception as exc:
                         raise ConnectionError(f"Invalid upstream CONNECT response: {status_line!r}") from exc
+                    if status == 407:
+                        self._refuse_rejected_credentials(client)
+                        return
                     if not 200 <= status < 300:
                         client.sendall(response or b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                         return
@@ -590,8 +882,7 @@ class ProxyRelay:
                         # _read_headers can read past the blank line; those bytes already belong to the tunnel.
                         client.sendall(tunnel_data)
                 else:
-                    host, port = _split_authority(target, 443)
-                    upstream = self._open_route(host, port, use_upstream)
+                    upstream = self._open_route(connect_host, connect_port, use_upstream)
                     self._track(upstream)
                     client.sendall(_CONNECTION_ESTABLISHED)
                     tunnel_started = True
@@ -600,6 +891,17 @@ class ProxyRelay:
                 self._tunnel(client, upstream)
                 return
 
+            # A browser talking to a proxy sends absolute-form requests. An
+            # origin-form request ("GET / HTTP/1.1") comes from something using
+            # the relay as a web server, and with its Host header pointing at the
+            # relay it would make the relay connect to itself over and over.
+            absolute = urlsplit(target)
+            if absolute.scheme.casefold() != "http" or not absolute.hostname:
+                client.sendall(_response("400 Bad Request", "The relay only accepts proxy requests."))
+                return
+            if self._is_relay_itself(absolute.hostname, absolute.port or 80, self.local_port):
+                client.sendall(_response("508 Loop Detected", "The relay does not forward to itself."))
+                return
             if via_http_proxy:
                 upstream = self._connect_upstream()
                 self._track(upstream)
@@ -617,11 +919,17 @@ class ProxyRelay:
                 upstream = self._open_route(host, port, use_upstream)
                 self._track(upstream)
             upstream.sendall(request_headers + leftover)
-            self._tunnel(client, upstream)
+            # A 407 from the upstream must not reach Chrome. It is spotted in
+            # the first bytes the upstream sends; waiting for them before
+            # tunnelling would stall a request body still being uploaded.
+            screen = self._screen_rejected_credentials(client) if via_http_proxy else None
+            self._tunnel(client, upstream, screen=screen)
         except Exception as exc:
             if isinstance(exc, SocksError) and exc.reply is None:
                 # Negotiation or authentication failure: every connection will fail the same way.
-                LOG.warning("SOCKS5 upstream %s failed: %s", self.upstream.label(), exc)
+                self._report(f"SOCKS5 upstream {self.upstream.label()} failed: {exc}")
+            elif isinstance(exc, UpstreamError):
+                self._report(str(exc))
             else:
                 LOG.debug("Proxy relay connection failed: %s", exc)
             if tunnel_started:
@@ -636,7 +944,10 @@ class ProxyRelay:
                     self._untrack(sock)
                     self._close_socket(sock)
 
-    def _tunnel(self, left: socket.socket, right: socket.socket) -> None:
+    def _tunnel(
+        self, left: socket.socket, right: socket.socket, *, screen: Callable[[bytes], bool] | None = None
+    ) -> None:
+        """Relay both ways; ``screen`` sees the first chunk from ``right`` and can stop the relay."""
         for sock in (left, right):
             sock.setblocking(True)
         peers = {left: right, right: left}
@@ -663,6 +974,10 @@ class ProxyRelay:
                     data = source.recv(_TUNNEL_CHUNK)
                     if not data:
                         return
+                    if screen is not None and source is right:
+                        allowed, screen = screen(data), None
+                        if not allowed:
+                            return
                     peers[source].sendall(data)
 
 
@@ -670,7 +985,9 @@ class ProxyRelay:
 WEBRTC_PROXY_ONLY = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
 
 
-def build_proxy_route(proxy: ProxySpec | None, *, verify_tls: bool = True) -> tuple[list[str], ProxyRelay | None]:
+def build_proxy_route(
+    proxy: ProxySpec | None, *, verify_tls: bool = True, restrict_clients: bool = False
+) -> tuple[list[str], ProxyRelay | None]:
     """Return Chrome's proxy arguments and, when one is needed, the started loopback relay.
 
     HTTP(S) upstreams and authenticated SOCKS5 go through the relay, which supplies the credentials that
@@ -684,7 +1001,7 @@ def build_proxy_route(proxy: ProxySpec | None, *, verify_tls: bool = True) -> tu
         return [f"--proxy-server={proxy.scheme}://{host}:{proxy.port}", WEBRTC_PROXY_ONLY], None
     if proxy.scheme == "socks4":
         raise ValueError("Authenticated SOCKS4 proxies are not supported; use SOCKS5 or an HTTP(S) proxy")
-    relay = ProxyRelay(proxy, verify_tls=verify_tls)
+    relay = ProxyRelay(proxy, verify_tls=verify_tls, restrict_clients=restrict_clients)
     relay.start()
     return [f"--proxy-server=http://127.0.0.1:{relay.local_port}", WEBRTC_PROXY_ONLY], relay
 

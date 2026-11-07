@@ -53,6 +53,9 @@ def make_capture(tmp_path: Path) -> tuple[CDPCapture, FakeStore, LiveSocket]:
     capture.ws = socket  # type: ignore[assignment]
     capture.targets["page-1"] = {"targetId": "t1", "type": "page", "url": f"{ORIGIN}/dashboard"}
     capture.enabled_sessions.add("page-1")
+    # The page's isolated world, where IndexedDB is read.
+    capture.interaction_contexts["page-1"] = {5}
+    capture.interaction_context_origins["page-1"] = {5: {"origin": ORIGIN, "frameId": "t1"}}
     return capture, store, socket
 
 
@@ -279,3 +282,41 @@ def test_no_dump_is_queued_once_the_browser_is_gone(tmp_path: Path) -> None:
     capture.request_client_storage_dump(ORIGIN, "indexeddb", reason="event")
     drain(capture)
     assert not socket.sent
+
+
+def test_indexeddb_is_never_read_in_the_page_world(tmp_path: Path) -> None:
+    capture, store, socket = make_capture(tmp_path)
+    capture.interaction_contexts.clear()
+    capture.interaction_context_origins.clear()
+    for _attempt in range(4):
+        capture.request_client_storage_dump(ORIGIN, "indexeddb", reason="targetAttached", database="db", store="s")
+        drain(capture)
+    assert sent_methods(socket) == []
+    skipped = written(store, "storage/indexeddb.jsonl")
+    assert [line["kind"] for line in skipped] == ["skipped"]
+    assert capture.stats["clientStorageSkipped"] == 1
+
+
+def test_indexeddb_waits_for_the_isolated_world_to_appear(tmp_path: Path) -> None:
+    capture, _store, socket = make_capture(tmp_path)
+    contexts = capture.interaction_contexts.pop("page-1")
+    capture.request_client_storage_dump(ORIGIN, "indexeddb", reason="targetAttached", database="db", store="s")
+    drain(capture)
+    assert sent_methods(socket) == []
+    capture.interaction_contexts["page-1"] = contexts
+    drain(capture)
+    assert sent_methods(socket) == ["Runtime.evaluate"]
+    assert socket.sent[0]["params"]["contextId"] == 5
+
+
+def test_an_old_wait_for_the_isolated_world_does_not_shorten_a_new_one(monkeypatch, tmp_path: Path) -> None:
+    from chrome_logger import client_storage
+
+    capture, _store, socket = make_capture(tmp_path)
+    capture.interaction_contexts.pop("page-1")
+    # Two earlier attempts, long ago, whose retries were dropped elsewhere.
+    capture._idb_context_waits[(ORIGIN, "db", "s")] = (2, 0.0)
+    monkeypatch.setattr(client_storage.time, "monotonic", lambda: 1_000.0)
+    capture._send_idb_data("page-1", ORIGIN, "db", "s", "indexedDBContentUpdated")
+    assert capture._idb_context_waits[(ORIGIN, "db", "s")] == (1, 1_000.0)
+    assert sent_methods(socket) == []
