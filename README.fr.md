@@ -111,6 +111,7 @@ Options importantes :
 | `--managed-chrome-dir PATH` | Emplacement du Chrome Stable officiel géré par l’outil |
 | `--no-download-chrome` | Refuse le téléchargement automatique si Chrome est absent |
 | `--refresh-managed-chrome` | Recherche une version Stable gérée plus récente lorsque le secours est utilisé |
+| `--note TEXTE` | Décrit le scénario (ce que vous testez, le compte utilisé, le bug) ; enregistré dans `manifest.json` et affiché en tête d'`INDEX.md` pour l'analyste |
 | `--version` | Affiche la version installée |
 
 ## Sortie
@@ -118,8 +119,8 @@ Options importantes :
 ```text
 session_YYYYMMDD_HHMMSS_mmm_PID_ALÉA/
 ├── INDEX.md                 # point d'entrée : bilan, guide des fichiers, lecture des bodies
-├── manifest.json            # inclut un inventaire `files` avec tailles et nombre d'enregistrements
-├── timeline.jsonl
+├── manifest.json            # inventaire `files` et chiffres clés `analysis`
+├── timeline.jsonl           # tous les types d'événements, triés par heure
 ├── network/
 │   ├── requests.jsonl
 │   └── bodies/
@@ -159,7 +160,8 @@ session_YYYYMMDD_HHMMSS_mmm_PID_ALÉA/
 │   ├── storage_attach.jsonl
 │   └── storage_end.jsonl
 └── reports/
-    ├── summary.txt
+    ├── overview.md          # à lire en second : pages, problèmes, endpoints API, action → requêtes
+    ├── summary.txt          # une ligne par requête, dans l'ordre de départ, avec heure et durée
     ├── stats.txt
     ├── requests.csv
     ├── session.har          # vue HAR 1.2, bodies intégrés jusqu'à 1 Mio
@@ -167,6 +169,10 @@ session_YYYYMMDD_HHMMSS_mmm_PID_ALÉA/
 ```
 
 `INDEX.md` est écrit à la fin de la capture. Il donne le statut et la raison de l'arrêt, les chiffres clés, chaque fichier avec sa taille et son nombre d'enregistrements, la façon d'ouvrir les bodies compressés et les limites à connaître. C'est le point d'entrée prévu pour quiconque analyse la session, y compris un agent automatisé ou une IA qui découvre le format.
+
+`reports/overview.md` est la lecture pré-digérée de la session, de taille bornée : pages visitées (y compris les changements de route des applications monopage), chaque erreur HTTP, échec réseau, erreur console et exception non interceptée, les endpoints API regroupés par méthode et chemin avec les identifiants repliés, et pour chaque clic, envoi de formulaire, modification ou touche, les requêtes du même onglet qui ont suivi. Chaque ligne donne l'`id` de l'enregistrement à retrouver dans `network/requests.jsonl`. La plupart des questions sur une session trouvent leur réponse dans `INDEX.md` et ce fichier, sans parcourir les flux bruts.
+
+`timeline.jsonl` entrelace requêtes, actions utilisateur (avec un `label` lisible comme `click button#go "Log in"`), navigations, erreurs et avertissements console, exceptions, changements de cookies et de Web Storage, et crashs de renderer. Les événements sont écrits au fil du traitement et le fichier est trié sur `time.epochMs` à la fin de la capture.
 
 `requests.jsonl` est canonique : il n'existe plus deux copies `full` et `filtered`. Le champ `isApi` permet de filtrer sans doubler les bodies sur disque.
 
@@ -231,7 +237,7 @@ python chrome_network_logger.py --proxy-file autre.txt
 
 Pour les proxies HTTP/HTTPS et SOCKS5 authentifiés, Chrome se connecte à un relay local sur `127.0.0.1`. Le relay ajoute l'authentification sans popup ; via SOCKS5, il transmet les noms d'hôte au proxy, qui fait donc la résolution DNS. La touche **P** bascule entre proxy et connexion directe (Windows, et Linux/macOS lorsque le logger tourne dans un terminal interactif). Toutes les connexions actives sont alors fermées afin que le nouvel itinéraire soit réellement utilisé.
 
-Les proxies SOCKS4/SOCKS5 sans authentification sont passés directement à Chrome. SOCKS4 avec authentification est refusé avec une erreur claire. La validation TLS d'un proxy HTTPS reste active, sauf option explicite `--proxy-insecure-tls`.
+Les proxies SOCKS4/SOCKS5 sans authentification sont passés directement à Chrome. SOCKS4 avec authentification est refusé avec une erreur claire. La validation TLS d'un proxy HTTPS reste active, sauf option explicite `--proxy-insecure-tls`. Dès qu'un proxy est choisi, Chrome reçoit aussi `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, pour qu'une page ne puisse pas découvrir l'adresse réelle via WebRTC/STUN.
 
 La présence de `proxy.txt` n’active jamais un proxy à elle seule : le routage reste direct tant qu’un sélecteur explicite n’est pas fourni. Le relay borne aussi le nombre de connexions simultanées et répond `503` en cas de saturation.
 
@@ -242,7 +248,7 @@ La présence de `proxy.txt` n’active jamais un proxy à elle seule : le routag
 - Les réponses très volumineuses ou streaming peuvent dépasser les buffers CDP ou la limite choisie.
 - Les bodies des redirections HTTP ne sont pas exposés par `Fetch.getResponseBody` ; chaque hop reste néanmoins conservé avec sa réponse et ses headers.
 - WebRTC média/DataChannel et le trafic paquet brut restent hors périmètre.
-- L'interception `Fetch` ne met en pause, par défaut, que les réponses `Document`, `XHR` et `Fetch` (`--intercept-bodies`), jamais les réponses en streaming ni celles qui dépassent la limite par body.
+- L'interception `Fetch` ne met en pause, par défaut, que les réponses `Document`, `XHR` et `Fetch` (`--intercept-bodies`). Elle ne met jamais en pause les réponses en streaming (SSE, NDJSON/JSON Lines, React Server Components, gRPC), les téléchargements (`Content-Disposition: attachment`), les réponses `XHR`/`Fetch` sans `Content-Length` (un script peut les lire en flux) ni celles qui dépassent la limite par body : leur body est lu par `Network.getResponseBody` une fois chargé, la page n'est donc jamais retenue.
 - Les capacités expérimentales optionnelles sont consignées dans `browser/protocol_capabilities.jsonl`. L’échec ou le timeout d’un domaine requis (`Network`, `Runtime`, `Page`, `Fetch` ou auto-attach) rend la capture invalide et donne un code de sortie non nul.
 
 Références officielles : [Network](https://chromedevtools.github.io/devtools-protocol/tot/Network/), [Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/), [Fetch](https://chromedevtools.github.io/devtools-protocol/tot/Fetch/).
@@ -260,6 +266,8 @@ chrome_logger/
 ├── client_storage.py      # dumps IndexedDB et Cache Storage
 ├── har.py                 # export HAR 1.2 du flux canonique
 ├── session_index.py       # INDEX.md, point d'entrée pour lecteurs et agents
+├── overview.py            # reports/overview.md, synthèse pour l'analyse
+├── labels.py              # descriptions lisibles des événements
 ├── fileio.py              # remplacement atomique avec reprises sous Windows
 ├── registry.py            # identité session/request/hop et ordre des ExtraInfo
 ├── storage.py             # writer thread, JSONL, bodies et rapports

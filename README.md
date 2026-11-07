@@ -111,6 +111,7 @@ Important options:
 | `--managed-chrome-dir PATH` | Cache location for the official managed Stable browser |
 | `--no-download-chrome` | Fail instead of downloading Chrome when no browser is installed |
 | `--refresh-managed-chrome` | Check for a newer managed Stable build when the fallback is used |
+| `--note TEXT` | Describe the scenario (what you test, which account, the bug); stored in `manifest.json` and shown first in `INDEX.md` for the analyst |
 | `--version` | Print the installed logger version |
 
 ## Output
@@ -118,8 +119,8 @@ Important options:
 ```text
 session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM/
 ├── INDEX.md                 # start here: outcome, file guide, how to read bodies
-├── manifest.json            # includes a `files` inventory with sizes and record counts
-├── timeline.jsonl
+├── manifest.json            # includes a `files` inventory and the `analysis` headline numbers
+├── timeline.jsonl           # every kind of event, sorted by time
 ├── network/
 │   ├── requests.jsonl
 │   └── bodies/<sha256>.*[.gz]
@@ -129,7 +130,8 @@ session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM/
 ├── storage/                 # cookie_changes, dom_storage_events, page_flushes, indexeddb, cache_storage
 ├── snapshots/               # start/end/attach dumps and rebuilt final state
 └── reports/
-    ├── summary.txt
+    ├── overview.md          # read second: pages, problems, API endpoints, action → requests
+    ├── summary.txt          # one line per request, in start order, with time and duration
     ├── stats.txt
     ├── requests.csv
     ├── session.har          # HAR 1.2 view, bodies inlined up to 1 MiB
@@ -137,6 +139,10 @@ session_YYYYMMDD_HHMMSS_mmm_PID_RANDOM/
 ```
 
 `INDEX.md` is written when the capture ends. It states the outcome and why the capture stopped, the key numbers, every file with its size and record count, how to open compressed bodies, and the caveats that apply. It is meant as the entry point for whoever analyses the session, including an automated or AI agent that has never seen the format.
+
+`reports/overview.md` is the pre-digested reading of the session, bounded in size: the pages visited (including single-page-application route changes), every HTTP error, network failure, console error and uncaught exception, the API endpoints grouped by method and path with identifiers collapsed, and for each click, submit, change or key press the requests of the same tab that followed it. Each row names the record `id` to look up in `network/requests.jsonl`. Most questions about a session can be answered from `INDEX.md` and this file without scanning the raw streams.
+
+`timeline.jsonl` interleaves requests, user actions (with a readable `label` such as `click button#go "Log in"`), navigations, console errors and warnings, uncaught exceptions, cookie and Web Storage changes, and renderer crashes. Events are written as they are processed and the file is sorted by `time.epochMs` when the capture ends.
 
 `network/requests.jsonl` is canonical. The `isApi` field provides filtering without maintaining duplicate `full` and `filtered` bodies.
 
@@ -180,7 +186,7 @@ python chrome_network_logger.py --proxy none
 python chrome_network_logger.py --proxy-prompt
 ```
 
-HTTP(S) upstreams and authenticated SOCKS5 upstreams use a loopback relay that injects the credentials, so Chrome never shows an authentication prompt. Through SOCKS5 the relay sends host names to the proxy, so DNS resolves on the proxy side. Press **P** to switch between the upstream and direct routing (Windows, and Linux/macOS when the logger runs in an interactive terminal); active sockets are closed during a switch. Unauthenticated SOCKS4/SOCKS5 proxies are passed directly to Chrome, and authenticated SOCKS4 is rejected clearly. HTTPS upstream certificate verification is enabled unless `--proxy-insecure-tls` is explicitly used.
+HTTP(S) upstreams and authenticated SOCKS5 upstreams use a loopback relay that injects the credentials, so Chrome never shows an authentication prompt. Through SOCKS5 the relay sends host names to the proxy, so DNS resolves on the proxy side. Press **P** to switch between the upstream and direct routing (Windows, and Linux/macOS when the logger runs in an interactive terminal); active sockets are closed during a switch. Unauthenticated SOCKS4/SOCKS5 proxies are passed directly to Chrome, and authenticated SOCKS4 is rejected clearly. HTTPS upstream certificate verification is enabled unless `--proxy-insecure-tls` is explicitly used. Whenever a proxy is selected, Chrome also gets `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, so a page cannot learn the real address through WebRTC/STUN.
 
 Merely having a `proxy.txt` file never enables a proxy: routing remains direct until `--proxy`, `--proxy-prompt`, or another explicit selector is used. The relay also limits concurrent connections and returns `503` when saturated.
 
@@ -191,7 +197,7 @@ Merely having a `proxy.txt` file never enables a proxy: routing remains direct u
 - Very large or streaming responses may exceed CDP buffers or the configured body limit.
 - Redirect response bodies are not exposed by `Fetch.getResponseBody`; redirect metadata and headers are still retained per hop.
 - Raw packet traffic and WebRTC media/DataChannel data remain out of scope.
-- Fetch interception pauses only response-stage `Document`, `XHR` and `Fetch` requests by default (`--intercept-bodies`), and never streamed responses or bodies above the per-body limit.
+- Fetch interception pauses only response-stage `Document`, `XHR` and `Fetch` requests by default (`--intercept-bodies`). It never pauses streamed responses (SSE, NDJSON/JSON Lines, React Server Components, gRPC), downloads (`Content-Disposition: attachment`), `XHR`/`Fetch` responses without a `Content-Length` (a script may be reading them as a stream), or bodies above the per-body limit; their bodies are read with `Network.getResponseBody` once loaded, so the page is never held back.
 - Optional experimental capabilities are recorded in `browser/protocol_capabilities.jsonl`. Failure or timeout of a required domain (`Network`, `Runtime`, `Page`, `Fetch`, or target auto-attach) marks the capture unhealthy and returns a non-zero exit code.
 
 Official references: [Network](https://chromedevtools.github.io/devtools-protocol/tot/Network/), [Target](https://chromedevtools.github.io/devtools-protocol/tot/Target/), and [Fetch](https://chromedevtools.github.io/devtools-protocol/tot/Fetch/).
@@ -209,6 +215,8 @@ chrome_logger/
 ├── client_storage.py      # IndexedDB and Cache Storage dumps
 ├── har.py                 # HAR 1.2 export of the canonical stream
 ├── session_index.py       # INDEX.md entry point for readers and agents
+├── overview.py            # reports/overview.md digest for analysts
+├── labels.py              # readable one-line descriptions of events
 ├── fileio.py              # atomic replace with Windows sharing-violation retries
 ├── registry.py            # session/request/hop identity and ExtraInfo ordering
 ├── storage.py             # writer thread, JSONL, bodies, and reports

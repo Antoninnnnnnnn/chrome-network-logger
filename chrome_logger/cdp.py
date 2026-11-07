@@ -643,6 +643,33 @@ class CDPCapture(
             except Exception as exc:
                 self._record_handler_error(task.__name__, exc)
 
+    def _target_crashed(self, params: dict[str, Any]) -> None:
+        """Record a renderer crash: it explains requests that end up incomplete."""
+        target_id = str(params.get("targetId") or "")
+        session_id = self.target_sessions.get(target_id)
+        timestamp = self.timestamps.normalize()
+        event = {
+            "event": "crashed",
+            "sessionId": session_id,
+            "target": self._target(session_id) if session_id else {"targetId": target_id},
+            "status": params.get("status"),
+            "errorCode": params.get("errorCode"),
+            "time": timestamp,
+        }
+        self.store.write_jsonl("browser/targets.jsonl", event, redact=True)
+        self.store.timeline(
+            "target_crashed",
+            timestamp,
+            sessionId=session_id,
+            targetId=target_id,
+            status=params.get("status"),
+            errorCode=params.get("errorCode"),
+        )
+        self.store.add_warning(
+            f"A renderer crashed ({params.get('status') or 'unknown status'}); "
+            "see browser/targets.jsonl for the tab and time"
+        )
+
     def _record_handler_error(self, where: str, exc: BaseException) -> None:
         """Count a handler failure and turn persistent or storage failures into a fatal error."""
         self.stats["eventErrors"] += 1
@@ -685,6 +712,8 @@ class CDPCapture(
                 self._target_info_changed(params.get("targetInfo") or {})
             elif method == "Target.detachedFromTarget":
                 self._detached(str(params.get("sessionId") or ""), "targetDetached")
+            elif method == "Target.targetCrashed":
+                self._target_crashed(params)
             elif method == "Target.targetDestroyed":
                 target_id = str(params.get("targetId") or "")
                 with self.state_lock:
@@ -768,6 +797,10 @@ class CDPCapture(
                 self._log_entry(session_id, params)
             elif method == "Page.frameNavigated":
                 self._navigation_event(session_id, "frameNavigated", params)
+            elif method == "Page.navigatedWithinDocument":
+                # history.pushState/replaceState and fragment changes: the
+                # route changes of single-page applications.
+                self._navigation_event(session_id, "navigatedWithinDocument", params)
             elif method in {"Page.frameStartedLoading", "Page.frameStoppedLoading"}:
                 self._navigation_event(session_id, method.rsplit(".", 1)[-1], params)
         except Exception as exc:
@@ -902,27 +935,32 @@ class CDPCapture(
             key = str(data["key"])
             fetch_id = str(data["fetchId"])
             session_id = data.get("sessionId")
-            with self.state_lock:
-                entry = self.registry.entries.get(key)
-                if entry:
-                    entry["_pendingFetchBody"] = False
-                    if error:
-                        self._record_body_failure(entry, "fetchResponseBodyError", error)
-                    else:
-                        self._store_response_body(
-                            entry,
-                            result.get("body"),
-                            bool(result.get("base64Encoded")),
-                            content_type=data.get("contentType"),
-                        )
-                        entry["_fetchBodyComplete"] = True
-                    if entry.get("_loadingComplete"):
+            try:
+                with self.state_lock:
+                    entry = self.registry.entries.get(key)
+                    if entry:
+                        entry["_pendingFetchBody"] = False
                         if error:
-                            self._request_network_body_fallback(key, "fetchBodyError")
+                            self._record_body_failure(entry, "fetchResponseBodyError", error)
                         else:
-                            self._schedule_finalize(key, reason="loadingFinished")
-                self.paused_fetches.pop(fetch_id, None)
-            self.send("Fetch.continueResponse", {"requestId": fetch_id}, session_id)
+                            self._store_response_body(
+                                entry,
+                                result.get("body"),
+                                bool(result.get("base64Encoded")),
+                                content_type=data.get("contentType"),
+                            )
+                            entry["_fetchBodyComplete"] = True
+                        if entry.get("_loadingComplete"):
+                            if error:
+                                self._request_network_body_fallback(key, "fetchBodyError")
+                            else:
+                                self._schedule_finalize(key, reason="loadingFinished")
+            finally:
+                # Whatever happened to the body, the page's request is paused
+                # and must be released, or it hangs until the capture ends.
+                with self.state_lock:
+                    self.paused_fetches.pop(fetch_id, None)
+                self.send("Fetch.continueResponse", {"requestId": fetch_id}, session_id)
             return
         if kind == "request_post_data":
             key = str(data["key"])
@@ -957,11 +995,21 @@ class CDPCapture(
                 if now - command.sent_at >= timeout:
                     expired.append((message_id, self.pending.pop(message_id)))
         for _, command in expired:
-            kind = command.kind
-            data = command.data
-            error = {"code": -1, "message": f"CDP command timed out ({kind})"}
-            if kind == "fetch_body":
-                key = str(data["key"])
+            try:
+                self._expire_command(command)
+            except Exception as exc:
+                # Isolated per command: an exception here must not leave the
+                # paused responses later in the batch unreleased.
+                self._record_handler_error(f"timeout of {command.kind}", exc)
+
+    def _expire_command(self, command: PendingCommand) -> None:
+        kind = command.kind
+        data = command.data
+        error = {"code": -1, "message": f"CDP command timed out ({kind})"}
+        if kind == "fetch_body":
+            key = str(data["key"])
+            fetch_id = str(data["fetchId"])
+            try:
                 with self.state_lock:
                     entry = self.registry.entries.get(key)
                     if entry:
@@ -969,98 +1017,98 @@ class CDPCapture(
                         self._record_body_failure(entry, "fetchResponseBodyError", error)
                         if entry.get("_loadingComplete"):
                             self._request_network_body_fallback(key, "fetchBodyTimeout")
-                fetch_id = str(data["fetchId"])
+            finally:
                 with self.state_lock:
                     self.paused_fetches.pop(fetch_id, None)
                 self.send("Fetch.continueResponse", {"requestId": fetch_id}, data.get("sessionId"))
-            elif kind == "response_body":
-                key = str(data["key"])
-                with self.state_lock:
-                    entry = self.registry.entries.get(key)
-                    if entry:
-                        entry["_pendingResponseBody"] = False
-                        self._record_body_failure(entry, "responseBodyError", error)
-                        self._schedule_finalize(key, "bodyTimeout", delay=0.01)
-            elif kind == "request_post_data":
-                key = str(data["key"])
-                with self.state_lock:
-                    entry = self.registry.entries.get(key)
-                    if entry:
-                        entry["_pendingPostData"] = False
-                        entry["requestPostDataError"] = error
-                        if entry.get("_loadingComplete"):
-                            self._schedule_finalize(key, "postDataTimeout", delay=0.01)
-            elif kind in {"snapshot_cookies", "snapshot_storage"}:
-                self._handle_snapshot_response(kind, data, error, {})
-            elif kind == "cookie_sync":
-                self._handle_cookie_sync(data, error, {})
-            elif kind in {"idb_names", "idb_database", "idb_data", "cache_names", "cache_entries"}:
-                self._handle_client_storage_response(kind, data, error, {})
-            elif kind == "interaction_script":
-                self.store.write_jsonl(
-                    "browser/protocol_errors.jsonl",
-                    {
-                        "time": self.timestamps.normalize(),
-                        "method": "Page.addScriptToEvaluateOnNewDocument",
-                        "sessionId": data.get("sessionId"),
-                        "error": error,
-                    },
-                    redact=True,
-                )
-            elif kind == "quiesce":
-                self._finish_quiesce_command(data, error)
-            elif kind == "attach_target":
-                target_id = str(data.get("targetId") or "")
-                with self.state_lock:
-                    already_captured = target_id in self.target_sessions
-                    if not already_captured:
-                        self.attached_targets.discard(target_id)
-                        if self.attach_attempts.get(target_id, 0) < 3:
-                            self.discovered_targets[target_id] = (
-                                time.monotonic() + 0.5,
-                                {"targetId": target_id},
-                            )
-                if already_captured:
-                    continue
-                self.store.write_jsonl(
-                    "browser/protocol_errors.jsonl",
-                    {
-                        "time": self.timestamps.normalize(),
-                        "method": "Target.attachToTarget",
-                        "targetId": target_id,
-                        "attempt": self.attach_attempts.get(target_id),
-                        "error": error,
-                    },
-                    redact=True,
-                )
-            elif kind == "capability":
-                self.store.write_jsonl(
-                    "browser/protocol_capabilities.jsonl",
-                    {
-                        "time": self.timestamps.normalize(),
-                        "method": data.get("method"),
-                        "sessionId": data.get("sessionId"),
-                        "available": False,
-                        "error": error,
-                    },
-                    redact=True,
-                )
-            elif kind == "optional_command":
-                self.store.write_jsonl(
-                    "browser/protocol_errors.jsonl",
-                    {
-                        "time": self.timestamps.normalize(),
-                        "method": data.get("method"),
-                        "optional": True,
-                        "error": error,
-                    },
-                    redact=True,
-                )
-            elif kind == "required_command":
-                self._handle_required_failure(data, error, timed_out=True)
-            elif kind == "interaction_binding":
-                self.stats["protocolErrors"] += 1
-                self.store.add_warning(f"Interaction binding timed out for session {data.get('sessionId')}")
+        elif kind == "response_body":
+            key = str(data["key"])
+            with self.state_lock:
+                entry = self.registry.entries.get(key)
+                if entry:
+                    entry["_pendingResponseBody"] = False
+                    self._record_body_failure(entry, "responseBodyError", error)
+                    self._schedule_finalize(key, "bodyTimeout", delay=0.01)
+        elif kind == "request_post_data":
+            key = str(data["key"])
+            with self.state_lock:
+                entry = self.registry.entries.get(key)
+                if entry:
+                    entry["_pendingPostData"] = False
+                    entry["requestPostDataError"] = error
+                    if entry.get("_loadingComplete"):
+                        self._schedule_finalize(key, "postDataTimeout", delay=0.01)
+        elif kind in {"snapshot_cookies", "snapshot_storage"}:
+            self._handle_snapshot_response(kind, data, error, {})
+        elif kind == "cookie_sync":
+            self._handle_cookie_sync(data, error, {})
+        elif kind in {"idb_names", "idb_database", "idb_data", "cache_names", "cache_entries"}:
+            self._handle_client_storage_response(kind, data, error, {})
+        elif kind == "interaction_script":
+            self.store.write_jsonl(
+                "browser/protocol_errors.jsonl",
+                {
+                    "time": self.timestamps.normalize(),
+                    "method": "Page.addScriptToEvaluateOnNewDocument",
+                    "sessionId": data.get("sessionId"),
+                    "error": error,
+                },
+                redact=True,
+            )
+        elif kind == "quiesce":
+            self._finish_quiesce_command(data, error)
+        elif kind == "attach_target":
+            target_id = str(data.get("targetId") or "")
+            with self.state_lock:
+                already_captured = target_id in self.target_sessions
+                if not already_captured:
+                    self.attached_targets.discard(target_id)
+                    if self.attach_attempts.get(target_id, 0) < 3:
+                        self.discovered_targets[target_id] = (
+                            time.monotonic() + 0.5,
+                            {"targetId": target_id},
+                        )
+            if already_captured:
+                return
+            self.store.write_jsonl(
+                "browser/protocol_errors.jsonl",
+                {
+                    "time": self.timestamps.normalize(),
+                    "method": "Target.attachToTarget",
+                    "targetId": target_id,
+                    "attempt": self.attach_attempts.get(target_id),
+                    "error": error,
+                },
+                redact=True,
+            )
+        elif kind == "capability":
+            self.store.write_jsonl(
+                "browser/protocol_capabilities.jsonl",
+                {
+                    "time": self.timestamps.normalize(),
+                    "method": data.get("method"),
+                    "sessionId": data.get("sessionId"),
+                    "available": False,
+                    "error": error,
+                },
+                redact=True,
+            )
+        elif kind == "optional_command":
+            self.store.write_jsonl(
+                "browser/protocol_errors.jsonl",
+                {
+                    "time": self.timestamps.normalize(),
+                    "method": data.get("method"),
+                    "optional": True,
+                    "error": error,
+                },
+                redact=True,
+            )
+        elif kind == "required_command":
+            self._handle_required_failure(data, error, timed_out=True)
+        elif kind == "interaction_binding":
+            self.stats["protocolErrors"] += 1
+            self.store.add_warning(f"Interaction binding timed out for session {data.get('sessionId')}")
 
     def _process_target_fallbacks(self) -> None:
         now = time.monotonic()

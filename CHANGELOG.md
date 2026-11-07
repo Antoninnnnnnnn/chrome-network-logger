@@ -2,6 +2,60 @@
 
 All notable changes to Chrome Network Logger are documented here.
 
+## Unreleased
+
+### Sessions easier to analyse
+
+- Write `reports/overview.md`, a bounded digest of the session: pages visited (with single-page-application route changes), HTTP errors, network failures, incomplete requests, console errors and uncaught exceptions, API endpoints grouped by method and path with identifiers collapsed, the requests that followed each click, submit, change or key press in the same tab, and hosts. Every row names the record `id` to look up. Its headline numbers are stored in `manifest.json` under `analysis`, shown in `INDEX.md`, and `INDEX.md` sends readers to the overview first.
+- Sort `timeline.jsonl` by time when the capture ends, with bounded memory. It was in processing order — a request was written after its body arrived — although `INDEX.md` described it as time-ordered.
+- Add console errors and warnings (redacted before being shortened), uncaught exceptions, cookie changes (names), Web Storage changes (keys), renderer crashes, and a readable `label` per user action (`click button#go "Log in"`) to the timeline; `request_finished` lines now carry the method, URL and duration.
+- Record single-page-application navigations (`Page.navigatedWithinDocument`: `history.pushState`, fragment changes) in `browser/navigations.jsonl` and the timeline. They were not captured.
+- `reports/summary.txt` and `reports/requests.csv` are in start order and show the start time and duration; `stats.txt` counts HTTP errors.
+- Interaction events carry `frameId`, `trusted` (`isTrusted`), and element `testId` and `label`; form submissions name the `submitter`. Requests carry Chrome's `hasUserGesture`, WebSocket records their `initiator`.
+- Renderer crashes (`Target.targetCrashed`) are recorded in `browser/targets.jsonl` with a manifest warning.
+- `--note TEXT` records what the capture is about (scenario, account, bug) in `manifest.json` and at the top of `INDEX.md`, the context an analyst cannot infer from the traffic.
+
+### Fixed — capture correctness
+
+- A streamed response (chunked `text/plain` or JSON without `Content-Length`, as many chat interfaces use) was paused by Fetch interception until its last byte, so the page showed nothing until the stream ended — 3 s instead of 4 ms on a local test. Such `XHR`/`Fetch` responses, downloads, JSON Lines/NDJSON variants and React Server Components payloads now flow and their body is read once loaded.
+- A paused response was never released if storing its body raised (for example deeply nested JSON in safe mode), leaving the page's request hanging until shutdown. One failing timed-out command no longer skips the paused responses after it.
+- A redirect hop still inside its ExtraInfo grace window at shutdown was written as `incomplete` and made the session `partial`.
+- A request that failed before any response (CORS, blocked) lost the raw response headers Chrome had reported.
+- A body that failed at the Fetch stage was labelled "no response was received" even for a `200`, and was counted twice when the fallback also failed; a fallback that succeeds no longer counts as a lost body.
+- Timestamps never recovered after the system slept: every later `finished` time was off by the sleep duration. The clock relation is re-anchored once two samples agree, and `durationMs` uses Chrome's monotonic clock.
+- A page or CDP timestamp the platform cannot convert raised inside the event handler.
+
+### Fixed — injected script
+
+- Stop listening to `unload`: Chrome logged a permissions-policy violation on every page (a false error in `browser/log.jsonl`) and it could keep pages out of the back/forward cache. `pagehide` already covers it.
+- Form submissions are read from the form controls instead of `new FormData(form)`, which fired a `formdata` event the page's own listeners received. The form's `elements`, `action` and `method` are read through the prototype getters, so a control named `action` no longer hides them; form-associated custom elements, whose value the isolated world cannot read, are marked as such.
+- An event on `<body>` or a large container serialized the whole page (`innerText`, `outerHTML`); text is read with a bounded walk and large elements keep only their opening tag, rebuilt from the attributes (cloning would run a custom element's constructor). Auto-repeated keys are ignored.
+- Characters typed through AltGr (`@`, `#`, `{` on many layouts), macOS Option or an IME were recorded as key presses; contenteditable editors are treated as typed text in safe mode.
+
+### Fixed — safe-mode redaction
+
+- `Referer`, `Location` and `Content-Location` are redacted as URLs (an OAuth `code` travelled on in `Referer`).
+- `cookieLine` of blocked and exempted cookies, list-shaped headers (Cache Storage entries) and `requestURL` are redacted.
+- Web Storage change events redact their values according to the storage key, as snapshots already did.
+
+### Proxy
+
+- `--proxy-prompt` did not prompt: `--proxy` defaulted to `none`, which returned before the prompt, so the capture silently went direct.
+- A transient `accept()` error (connection aborted, descriptor table full) ended the relay thread while its port stayed open, so every later request hung.
+- A proxy line with an invalid port logged the line, password included.
+- A password containing `@` in the `host:port:user:password` and space-separated formats was parsed as a URL and the proxy was skipped.
+- With a proxy, WebRTC is restricted to proxied routes (`--force-webrtc-ip-handling-policy=disable_non_proxied_udp`) so it cannot reveal the real IP address.
+
+### Managed Chrome
+
+- A truncated download is reported as such instead of as an invalid ZIP.
+- `--refresh-managed-chrome` uses the cached build when the metadata endpoint cannot be reached.
+- Two runs installing the same version at once, or an antivirus holding the new directory, no longer fail the install at the final rename.
+
+### Development
+
+- Tests import the package from the checkout (`pythonpath = ["."]`), not from another installed copy.
+
 ## 3.2.0 — 2026-11-07
 
 ### Sessions ready for automated analysis

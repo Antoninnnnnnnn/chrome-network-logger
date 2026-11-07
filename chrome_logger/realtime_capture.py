@@ -156,6 +156,7 @@ class RealtimeCaptureMixin:
             "target": entry.get("target"),
             "type": "WebSocket",
             "isApi": True,
+            "initiator": entry.get("initiator"),
             "started": entry.get("created"),
             "finished": entry.get("closed"),
             "url": entry.get("url"),

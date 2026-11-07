@@ -87,7 +87,14 @@ def parse_proxy_line(line: str) -> ProxySpec | None:
     if not raw or raw.startswith("#"):
         return None
 
-    if any(ch.isspace() for ch in raw) and "://" not in raw and "@" not in raw:
+    # Only an explicit scheme or a user:pass@host authority is URL syntax; a
+    # password containing "@" in the colon or space format is not.
+    colon_parts = raw.split(":", 3)
+    colon_format = len(colon_parts) == 4 and colon_parts[1].strip().isdigit()
+    url_like = "://" in raw or (
+        "@" in raw and not colon_format and not raw.startswith("[") and not any(ch.isspace() for ch in raw)
+    )
+    if any(ch.isspace() for ch in raw) and not url_like:
         parts = raw.split()
         if len(parts) == 2:
             return _validate("http", parts[0], int(parts[1]), None, None)
@@ -95,13 +102,14 @@ def parse_proxy_line(line: str) -> ProxySpec | None:
             return _validate("http", parts[0], int(parts[1]), parts[2], parts[3])
         raise ValueError("Expected 'host port' or 'host port user password'")
 
-    if "://" in raw or "@" in raw:
+    if url_like:
         candidate = raw if "://" in raw else "http://" + raw
         parsed = urlsplit(candidate)
         try:
             port = parsed.port
         except ValueError as exc:
-            raise ValueError(f"Invalid proxy port in {raw!r}") from exc
+            # Never echo the line: it can carry the proxy password.
+            raise ValueError("Invalid proxy port") from exc
         return _validate(
             parsed.scheme or "http",
             parsed.hostname,
@@ -443,8 +451,15 @@ class ProxyRelay:
                 client, _ = self._server.accept()
             except TimeoutError:
                 continue
-            except OSError:
-                break
+            except OSError as exc:
+                if self._stop.is_set() or self._server.fileno() == -1:
+                    break
+                # ECONNABORTED/WSAECONNRESET or a full descriptor table (EMFILE)
+                # are transient. Leaving the loop would keep the port open but
+                # unanswered, and every request through the relay would hang.
+                LOG.warning("Proxy relay could not accept a connection: %s", exc)
+                self._stop.wait(0.1)
+                continue
             client.settimeout(self.connect_timeout)
             if not self._connection_slots.acquire(blocking=False):
                 try:
@@ -651,22 +666,27 @@ class ProxyRelay:
                     peers[source].sendall(data)
 
 
+# Without it, WebRTC sends STUN over direct UDP and exposes the real IP address.
+WEBRTC_PROXY_ONLY = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+
+
 def build_proxy_route(proxy: ProxySpec | None, *, verify_tls: bool = True) -> tuple[list[str], ProxyRelay | None]:
     """Return Chrome's proxy arguments and, when one is needed, the started loopback relay.
 
     HTTP(S) upstreams and authenticated SOCKS5 go through the relay, which supplies the credentials that
     Chrome's command line cannot carry. Unauthenticated SOCKS4/SOCKS5 proxies are handed to Chrome as is.
+    WebRTC is kept off direct UDP so a page cannot learn the real address behind the proxy through STUN.
     """
     if proxy is None:
         return [], None
     if proxy.scheme in {"socks4", "socks5"} and not proxy.has_auth:
         host = f"[{proxy.host}]" if ":" in proxy.host else proxy.host
-        return [f"--proxy-server={proxy.scheme}://{host}:{proxy.port}"], None
+        return [f"--proxy-server={proxy.scheme}://{host}:{proxy.port}", WEBRTC_PROXY_ONLY], None
     if proxy.scheme == "socks4":
         raise ValueError("Authenticated SOCKS4 proxies are not supported; use SOCKS5 or an HTTP(S) proxy")
     relay = ProxyRelay(proxy, verify_tls=verify_tls)
     relay.start()
-    return [f"--proxy-server=http://127.0.0.1:{relay.local_port}"], relay
+    return [f"--proxy-server=http://127.0.0.1:{relay.local_port}", WEBRTC_PROXY_ONLY], relay
 
 
 def start_toggle_keyboard(

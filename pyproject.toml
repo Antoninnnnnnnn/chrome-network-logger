@@ -60,6 +60,8 @@ chrome_logger = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import the package from this checkout, never from another installed copy.
+pythonpath = ["."]
 addopts = "-q"
 
 [tool.ruff]

@@ -184,8 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--proxy",
         metavar="N|random|none",
-        default="none",
-        help="Select a proxy from proxy.txt; direct connection is the default",
+        default=None,
+        help="Select a proxy from proxy.txt; direct connection (none) is the default",
     )
     parser.add_argument("--proxy-prompt", action="store_true", help="Prompt for a proxy")
     parser.add_argument("--proxy-file", default="proxy.txt", help="Proxy list path")
@@ -200,6 +200,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--duration", type=_non_negative_finite_float, help="Stop automatically after this many seconds"
+    )
+    parser.add_argument(
+        "--note",
+        help="What this capture is about (scenario, bug, account used); shown at the top of INDEX.md for the analyst",
     )
     parser.add_argument("--version", action="version", version=f"chrome-network-logger {__version__}")
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
@@ -361,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
 
     redactor = Redactor(config.sensitive_mode)
     store = CaptureStore(config, redactor)
+    if args.note and args.note.strip():
+        store.set_manifest(note=args.note.strip()[:2000])
     if managed_browser:
         store.set_manifest(
             browserInstall={

@@ -6,6 +6,7 @@ import pytest
 
 from chrome_logger import proxy as proxy_module
 from chrome_logger.proxy import (
+    WEBRTC_PROXY_ONLY,
     ProxyRelay,
     ProxySpec,
     _split_authority,
@@ -90,7 +91,7 @@ def test_random_proxy_choices_use_the_random_module(monkeypatch) -> None:
     ],
 )
 def test_unauthenticated_socks_goes_straight_to_chrome(proxy: ProxySpec, argument: str) -> None:
-    assert build_proxy_route(proxy) == ([argument], None)
+    assert build_proxy_route(proxy) == ([argument, WEBRTC_PROXY_ONLY], None)
 
 
 def test_authenticated_socks5_is_routed_through_the_relay() -> None:
@@ -100,7 +101,7 @@ def test_authenticated_socks5_is_routed_through_the_relay() -> None:
     try:
         assert relay.upstream == proxy
         assert relay.enabled is True
-        assert args == [f"--proxy-server=http://127.0.0.1:{relay.local_port}"]
+        assert args == [f"--proxy-server=http://127.0.0.1:{relay.local_port}", WEBRTC_PROXY_ONLY]
     finally:
         relay.stop()
 

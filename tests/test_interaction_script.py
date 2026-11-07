@@ -33,8 +33,11 @@ def test_safe_interaction_script_never_serializes_raw_outer_html_or_form_values(
 def test_injected_script_flushes_storage_before_a_page_disappears(tmp_path: Path) -> None:
     capture = CDPCapture(9222, CaptureConfig(tmp_path, tmp_path / "profile"), DummyStore())
     script = capture._interaction_script()
-    for trigger in ("pagehide", "freeze", "unload", "beforeunload"):
+    for trigger in ("pagehide", "freeze", "beforeunload"):
         assert f"flushState('{trigger}')" in script
+    # An unload listener logs a permissions-policy violation on the page and
+    # can exclude it from the back/forward cache; pagehide covers that case.
+    assert "addEventListener('unload'" not in script
     assert "document.visibilityState === 'hidden'" in script
     assert "event: 'storage_state'" in script
     # Safe mode must not ship raw cookie values out of the page.

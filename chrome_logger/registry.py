@@ -129,7 +129,7 @@ class RequestRegistry:
                 continue
             # Do not guess while responseReceived/redirectHasExtraInfo has not
             # told us whether this hop expects an ExtraInfo event.
-            if entry.get("_expectedResponseExtra") is not True:
+            if entry.get("_expectedResponseExtra") is not True and not entry.get("_acceptsFailureExtra"):
                 continue
             if "response" in entry.get("extraInfo", {}):
                 continue
@@ -164,6 +164,15 @@ class RequestRegistry:
         if not entry:
             return []
         entry["_expectedResponseExtra"] = bool(expected)
+        base = self.base_key(entry.get("sessionId"), str(entry.get("requestId")))
+        return self._drain_response_extra(base)
+
+    def accept_response_extra_for_failure(self, key: str) -> list[str]:
+        """Let a hop that failed without responseReceived take a queued or late response ExtraInfo."""
+        entry = self.entries.get(key)
+        if not entry:
+            return []
+        entry["_acceptsFailureExtra"] = True
         base = self.base_key(entry.get("sessionId"), str(entry.get("requestId")))
         return self._drain_response_extra(base)
 

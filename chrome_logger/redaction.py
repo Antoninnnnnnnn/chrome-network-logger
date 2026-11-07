@@ -116,6 +116,8 @@ _SENSITIVE_NORMALIZED_FRAGMENTS = {
     "authcode",
 }
 
+_URL_HEADERS = {"referer", "location", "content-location"}
+
 _COOKIE_CONTAINER_KEYS = {
     "cookie",
     "cookies",
@@ -222,14 +224,37 @@ class Redactor:
         return _fingerprint(value, self._key)
 
     def headers(self, headers: Any) -> Any:
-        if not self.enabled or not isinstance(headers, dict):
+        if not self.enabled:
+            return copy.deepcopy(headers)
+        if isinstance(headers, list):
+            # Cache Storage and Fetch use [{name, value}] instead of a mapping.
+            out: list[Any] = []
+            for item in headers:
+                if isinstance(item, dict) and isinstance(item.get("name"), str) and "value" in item:
+                    clean = dict(item)
+                    clean["value"] = self.headers({item["name"]: item["value"]})[item["name"]]
+                    out.append(clean)
+                else:
+                    out.append(self.object(item))
+            return out
+        if not isinstance(headers, dict):
             return copy.deepcopy(headers)
         result: dict[str, Any] = {}
         for key, value in headers.items():
-            result[str(key)] = (
-                self.value(value) if _is_sensitive_key(key, preserve_protocol_ids=False) else self.object(value)
-            )
+            if _is_sensitive_key(key, preserve_protocol_ids=False):
+                result[str(key)] = self.value(value)
+            elif str(key).lower() in _URL_HEADERS and isinstance(value, str):
+                # An OAuth callback's code travels on in Referer and Location.
+                result[str(key)] = self.url(value)
+            else:
+                result[str(key)] = self.object(value)
         return result
+
+    def keyed_value(self, key: Any, value: Any) -> Any:
+        """Redact ``value`` as it would be under the field name ``key`` (storage keys, header names)."""
+        if not self.enabled:
+            return value
+        return self.object({str(key): value}, preserve_protocol_ids=False)[str(key)]
 
     def _redact_parameters(self, value: str) -> str:
         try:
@@ -322,9 +347,13 @@ class Redactor:
                     "formaction",
                     "poster",
                     "urlfragment",
+                    "requesturl",
                 } and isinstance(item, str):
                     out[key_s] = self.url(item) if normalized != "urlfragment" else self._redact_parameters(item)
                 elif cookie_object and normalized == "value":
+                    out[key_s] = self.value(item)
+                elif normalized == "cookieline":
+                    # A raw Set-Cookie line of a blocked or exempted cookie.
                     out[key_s] = self.value(item)
                 elif normalized in _COOKIE_CONTAINER_KEYS:
                     out[key_s] = self.object(
@@ -420,7 +449,8 @@ class Redactor:
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+                # RecursionError: absurdly nested JSON falls back to text redaction.
                 parsed = None
         if "application/x-www-form-urlencoded" in ctype:
             return self._redact_parameters(text)

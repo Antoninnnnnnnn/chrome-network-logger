@@ -7,6 +7,7 @@ from typing import Any
 
 from .client_storage import storage_origin
 from .constants import PAGE_TYPES
+from .labels import TIMELINE_CONSOLE_LEVELS, console_text, interaction_label, short_text
 from .models import PendingCommand
 
 
@@ -23,9 +24,12 @@ class BrowserCaptureMixin:
             )
             return
         context_id = params.get("executionContextId")
+        frame_id = None
         if context_id is not None:
             with self.state_lock:
                 allowed = int(context_id) in self.interaction_contexts.get(session_id or "", set())
+                context = self.interaction_context_origins.get(session_id or "", {}).get(int(context_id)) or {}
+                frame_id = context.get("frameId")
             if not allowed:
                 self.stats["droppedUserEvents"] += 1
                 return
@@ -36,6 +40,8 @@ class BrowserCaptureMixin:
         if not isinstance(payload, dict):
             payload = {"event": "unknown", "value": payload}
         payload["sessionId"] = session_id
+        # Joins the event to requests.jsonl, whose records carry frameId too.
+        payload["frameId"] = frame_id
         payload["executionContextId"] = context_id
         payload["targetContext"] = self._target(session_id)
         timestamp = self.timestamps.from_epoch_ms(payload.get("ts"))
@@ -45,7 +51,14 @@ class BrowserCaptureMixin:
         relative = "interactions/forms.jsonl" if event_name == "form_submit" else "interactions/events.jsonl"
         self.stats["userEvents"] += 1
         self.store.write_jsonl(relative, clean, redact=False)
-        self.store.timeline("user_event", timestamp, sessionId=session_id, event=event_name, target=clean.get("target"))
+        self.store.timeline(
+            "user_event",
+            timestamp,
+            sessionId=session_id,
+            event=event_name,
+            label=interaction_label(clean),
+            target=clean.get("target"),
+        )
 
     def _console_event(self, session_id: str | None, params: dict[str, Any]) -> None:
         values = []
@@ -62,6 +75,18 @@ class BrowserCaptureMixin:
             "executionContextId": params.get("executionContextId"),
         }
         self.store.write_jsonl("browser/console.jsonl", event, redact=True)
+        if event["level"] in TIMELINE_CONSOLE_LEVELS:
+            # Errors and warnings belong next to the requests and clicks that
+            # caused them; debug chatter stays in console.jsonl only.
+            self.store.timeline(
+                "console",
+                event["time"],
+                sessionId=session_id,
+                level=event["level"],
+                # Redact the whole text first: shortening joins lines and cuts
+                # tokens, which hides them from line- and token-based patterns.
+                text=short_text(self.store.redactor.text(" ".join(console_text(value) for value in values))),
+            )
 
     def _exception_event(self, session_id: str | None, params: dict[str, Any]) -> None:
         details = copy.deepcopy(params.get("exceptionDetails") or {})
@@ -72,6 +97,19 @@ class BrowserCaptureMixin:
             "details": details,
         }
         self.store.write_jsonl("browser/exceptions.jsonl", event, redact=True)
+        exception = details.get("exception") or {}
+        self.store.timeline(
+            "exception",
+            event["time"],
+            sessionId=session_id,
+            text=short_text(
+                self.store.redactor.text(
+                    str(exception.get("description") or details.get("text") or "Uncaught exception")
+                )
+            ),
+            url=details.get("url"),
+            lineNumber=details.get("lineNumber"),
+        )
 
     def _log_entry(self, session_id: str | None, params: dict[str, Any]) -> None:
         entry = copy.deepcopy(params.get("entry") or {})
@@ -334,6 +372,49 @@ class BrowserCaptureMixin:
     return SAFE && (isSensitiveElement(el) || isFormControl(el)) ? redact(value) : value;
   };
 
+  // Bounded reads: an event on <body> or a large container must not
+  // serialize the whole page (innerText forces layout, outerHTML copies it).
+  const SKIP_TEXT = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
+  const textOf = (el) => {
+    let out = '';
+    try {
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+        acceptNode: (node) => (node.parentElement && SKIP_TEXT.has(node.parentElement.tagName)
+          ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT)
+      });
+      let node;
+      while ((node = walker.nextNode()) && out.length < 600) out += node.nodeValue + ' ';
+    } catch (_) {}
+    return out.replace(/\s+/g, ' ').trim().slice(0, 500);
+  };
+  const isLarge = (el) => el === document.body || el === document.documentElement
+    || el.getElementsByTagName('*').length > 200;
+  const testIdOf = (el) => {
+    for (const name of ['data-testid', 'data-test-id', 'data-test', 'data-cy', 'data-qa']) {
+      const value = el.getAttribute(name);
+      if (value) return value.slice(0, 200);
+    }
+    return null;
+  };
+  const labelOf = (el) => {
+    try {
+      const labels = el.labels ? Array.from(el.labels) : [];
+      const ids = String(el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+      const parts = [...labels.map(textOf), ...ids.map((id) => {
+        const node = document.getElementById(id);
+        return node ? textOf(node) : '';
+      })].filter(Boolean);
+      return parts.length ? parts.join(' ').slice(0, 200) : null;
+    } catch (_) { return null; }
+  };
+
+  const escapeAttr = (value) => String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  const openingTag = (el, attrs) => {
+    const tag = el.tagName.toLowerCase();
+    const parts = Object.entries(attrs).map(([name, value]) => `${name}="${escapeAttr(value)}"`);
+    return `<${[tag, ...parts].join(' ')}>`;
+  };
+
   const describe = (el) => {
     if (!(el instanceof Element)) return null;
     const rect = el.getBoundingClientRect();
@@ -344,12 +425,18 @@ class BrowserCaptureMixin:
       attrs[attr.name] = SAFE && (name === 'value' || name === 'srcdoc' || looksSensitive(name)) ? redact(value) : value;
     }
     const sensitiveElement = isSensitiveElement(el);
+    const large = isLarge(el);
     let outerHTML = '';
     if (SAFE) {
       outerHTML = `<${el.tagName.toLowerCase()} data-capture-redacted="true">`;
     } else {
-      try { outerHTML = String(el.outerHTML || '').slice(0, 8000); } catch (_) {}
+      try {
+        // A large element keeps only its own tag: its subtree would be huge.
+        outerHTML = large ? openingTag(el, attrs) + '<!-- children omitted -->'
+          : String(el.outerHTML || '').slice(0, 8000);
+      } catch (_) {}
     }
+    const typedText = isFormControl(el) || el.isContentEditable;
     return {
       tag: el.tagName.toLowerCase(), id: el.id || null,
       classes: typeof el.className === 'string' ? el.className : null,
@@ -357,7 +444,9 @@ class BrowserCaptureMixin:
       ariaLabel: el.getAttribute('aria-label'), placeholder: el.getAttribute('placeholder'),
       autocomplete: el.getAttribute('autocomplete'), value: valueOf(el),
       checked: ('checked' in el) ? Boolean(el.checked) : null,
-      text: SAFE && (sensitiveElement || isFormControl(el)) ? '' : String(el.innerText || el.textContent || '').trim().slice(0, 500),
+      // Typed text (form controls, contenteditable editors) is a value.
+      text: SAFE && (sensitiveElement || typedText) ? '' : textOf(el),
+      testId: testIdOf(el), label: labelOf(el),
       href: el.getAttribute('href'), attrs,
       rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
       cssPath: cssPath(el), xpath: xpath(el), outerHTML
@@ -365,27 +454,77 @@ class BrowserCaptureMixin:
   };
 
   const emit = (payload) => { try { send(JSON.stringify(payload)); } catch (_) {} };
-  const base = (event, target) => ({event, ts: Date.now(), url: location.href, target: describe(target)});
-  document.addEventListener('click', (e) => emit({...base('click', e.target), button: e.button, x: e.clientX, y: e.clientY}), listenerOptions);
-  document.addEventListener('change', (e) => emit(base('change', e.target)), listenerOptions);
+  // isTrusted is false for events a script dispatched (element.click()).
+  const base = (event, target, e) => ({
+    event, ts: Date.now(), url: location.href, trusted: e ? e.isTrusted : null, target: describe(target)
+  });
+  document.addEventListener('click', (e) => emit({...base('click', e.target, e), button: e.button, x: e.clientX, y: e.clientY}), listenerOptions);
+  document.addEventListener('change', (e) => emit(base('change', e.target, e)), listenerOptions);
   const timers = new WeakMap();
   document.addEventListener('input', (e) => {
     if (!(e.target instanceof Element)) return;
     clearTimeout(timers.get(e.target));
-    timers.set(e.target, setTimeout(() => emit(base('input', e.target)), 300));
+    timers.set(e.target, setTimeout(() => emit(base('input', e.target, e)), 300));
   }, listenerOptions);
   document.addEventListener('keydown', (e) => {
     const key = e.key || '';
-    if (key.length <= 1 && !e.ctrlKey && !e.metaKey && !e.altKey) return;
-    emit({...base('keydown', e.target), key, code: e.code, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey});
+    if (e.repeat || e.isComposing || key === 'Process' || key === 'Dead') return;
+    // AltGr reports Ctrl+Alt on Windows: AltGr+2 is "@" typed, not a shortcut.
+    const altGraph = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
+    if (key.length <= 1 && (altGraph || (!e.ctrlKey && !e.metaKey))) return;
+    emit({...base('keydown', e.target, e), key, code: e.code, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey});
   }, listenerOptions);
-  document.addEventListener('focusin', (e) => emit(base('focus', e.target)), listenerOptions);
+  document.addEventListener('focusin', (e) => emit(base('focus', e.target, e)), listenerOptions);
+  // The entries FormData would hold, without constructing one: the
+  // constructor fires a `formdata` event the page's listeners would see.
+  const formGetter = (name) => {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, name);
+    return (form) => { try { return descriptor.get.call(form); } catch (_) { return null; } };
+  };
+  const formControls = formGetter('elements');
+  const formAction = formGetter('action');
+  const formMethod = formGetter('method');
+  const NATIVE_CONTROLS = [HTMLInputElement, HTMLSelectElement, HTMLTextAreaElement, HTMLButtonElement,
+    HTMLFieldSetElement, HTMLOutputElement, HTMLObjectElement];
+  const formEntries = (form, submitter) => {
+    const entries = [];
+    for (const el of Array.from(formControls(form) || [])) {
+      const name = el.getAttribute('name');
+      if (!name || el.matches(':disabled')) continue;
+      if (!NATIVE_CONTROLS.some((type) => el instanceof type)) {
+        // A form-associated custom element keeps its value in page-defined
+        // properties this isolated world cannot read: say so explicitly.
+        entries.push([name, '<value not readable: custom form element>']);
+        continue;
+      }
+      const type = String(el.type || '').toLowerCase();
+      if (el instanceof HTMLButtonElement || ['submit', 'button', 'reset', 'image'].includes(type)) {
+        if (el === submitter && type !== 'image') entries.push([name, el.value]);
+        continue;
+      }
+      if (el instanceof HTMLFieldSetElement || el instanceof HTMLOutputElement || el instanceof HTMLObjectElement) continue;
+      if (type === 'checkbox' || type === 'radio') {
+        if (el.checked) entries.push([name, el.value || 'on']);
+        continue;
+      }
+      if (type === 'file') {
+        for (const file of Array.from(el.files || [])) entries.push([name, file]);
+        continue;
+      }
+      if (el instanceof HTMLSelectElement) {
+        for (const option of Array.from(el.selectedOptions)) entries.push([name, option.value]);
+        continue;
+      }
+      entries.push([name, String(el.value ?? '')]);
+    }
+    return entries;
+  };
   document.addEventListener('submit', (e) => {
     const form = e.target;
     if (!(form instanceof HTMLFormElement)) return;
     const data = {};
     try {
-      new FormData(form).forEach((value, key) => {
+      formEntries(form, e.submitter).forEach(([key, value]) => {
         const normalized = value instanceof File
           ? {name: SAFE ? redact(value.name) : value.name, size: value.size, type: value.type}
           : String(value).slice(0, 10000);
@@ -397,13 +536,16 @@ class BrowserCaptureMixin:
         }
       });
     } catch (error) { data.__error = String(error); }
-    emit({...base('form_submit', form), action: form.action, method: form.method, data});
+    emit({
+      ...base('form_submit', form, e), action: formAction(form), method: formMethod(form), data,
+      submitter: e.submitter ? describe(e.submitter) : null
+    });
   }, listenerOptions);
   if (CAPTURE_CLIPBOARD) {
     document.addEventListener('paste', (e) => {
       let text = '';
       try { text = (e.clipboardData || window.clipboardData).getData('text') || ''; } catch (_) {}
-      emit({...base('paste', e.target), data: SAFE ? redact(text) : text.slice(0, 10000)});
+      emit({...base('paste', e.target, e), data: SAFE ? redact(text) : text.slice(0, 10000)});
     }, listenerOptions);
   }
   const dumpStorage = (factory) => {
@@ -441,9 +583,11 @@ class BrowserCaptureMixin:
       cookie: cookieState()
     });
   };
+  // No `unload` listener: `pagehide` fires in every case `unload` would, and
+  // an `unload` listener makes Chrome log a permissions-policy violation on
+  // the page and can keep the page out of the back/forward cache.
   window.addEventListener('pagehide', () => flushState('pagehide'), listenerOptions);
   window.addEventListener('freeze', () => flushState('freeze'), listenerOptions);
-  window.addEventListener('unload', () => flushState('unload'), listenerOptions);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flushState('hidden');
   }, listenerOptions);

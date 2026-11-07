@@ -22,6 +22,8 @@ bodies, and the caveats below. It is a guide, not a canonical input.
 - warnings, capture statistics, writer health, and body-storage totals;
 - Chrome and protocol versions after a successful CDP connection;
 - `browserInstall`, identifying a system/explicit browser or the managed Stable version, platform, and locally computed archive/executable SHA-256 values;
+- `note`: the operator's `--note` text, when given;
+- `analysis`: headline numbers of `reports/overview.md` (`httpErrors`, `networkFailures`, `cancelledRequests`, `consoleErrors`, `exceptions`, `apiEndpoints`, `pagesVisited`, `userActions`, `hosts`);
 - `files`: every session file except body blobs as `{path, bytes, records?}` (`records` = line count of a JSONL file), plus one `network/bodies/` entry with the blob count and total size;
 - `warnings` (at most 200 distinct messages) and `warningsSuppressed` when more were dropped;
 - `writer.queuedBytesHighWatermark`, the peak amount of data waiting for the disk.
@@ -42,6 +44,10 @@ had finished but was still waiting for its `ExtraInfo` or body when its target o
 complete, with `extraInfoIncomplete: true` and/or a `responseBodyError` / `requestPostDataError` explaining what was
 not returned.
 
+`hasUserGesture` is Chrome's own flag for a request started by a user action. `durationMs` is measured on Chrome's monotonic clock when both ends carry `cdpMonotonicSeconds`. A request that failed before any response (CORS, blocked) keeps the raw response headers Chrome reported in `extraInfo.response`. WebSocket records carry their `initiator`.
+
+`network/requests.jsonl` is written in completion order; sort on `started.epochMs` for start order.
+
 Private implementation fields beginning with `_` are removed before final records are written.
 
 ## Body references
@@ -59,13 +65,14 @@ If the session body limit is reached, the record instead has `omitted: true`, `o
 
 ## Other streams
 
-- `timeline.jsonl`: normalized cross-domain summary events.
+- `timeline.jsonl`: one compact event per line, sorted by `time.epochMs` when the capture ends (a line without a time keeps the position of the line before it). `kind` is one of `request_started`, `request_finished` (with `method`, `url`, `status`, `durationMs`), `websocket_created`, `websocket_closed`, `user_event` (with a readable `label`), `navigation` (including `navigatedWithinDocument` for single-page-application route changes), `console` (levels `error`, `warning` and `assert` only, text truncated), `exception`, `cookie_change` (names only), `storage_change` (keys only) and `target_crashed`. Values stay in the dedicated files.
 - `realtime/`: WebSocket frames/errors/connections, SSE messages, and WebTransport lifecycle. Text frames carry `payloadData`; in raw mode a binary frame up to the inline limit carries `payloadBase64` (plus `payloadText` when it is printable UTF-8) instead of a body file; larger frames carry a body reference in `payload`.
-- `interactions/`: user and form events from the isolated interaction world.
+- `interactions/`: user and form events from the isolated interaction world. Each event has `frameId` (joins to the requests of the same frame), `trusted` (`isTrusted`: false when a script dispatched it) and a `target` description with `testId` (`data-testid`/`data-test`/`data-cy`/`data-qa`) and `label` (the associated `<label>` or `aria-labelledby` text). `form_submit` events also describe the `submitter` button.
 - `browser/`: targets, navigation, console, exceptions, logs, protocol diagnostics, and proxy toggles.
 - `snapshots/`: start/end/attach/navigation cookie and Web Storage dumps (Web Storage is read with `DOMStorage.getDOMStorageItems`, `source` names it, and pages without a web origin are skipped), plus `cookies_final.json` and `dom_storage_final.json` rebuilt from the event stream. A full dump replaces the reconstructed content of its area. `sessionStorage` belongs to one tab, so each tab has its own entry with a `sessionId` and a three-element `key`.
 - `storage/indexeddb.jsonl` and `storage/cache_storage.jsonl`: IndexedDB database lists, object-store schemas and bounded record dumps, plus Cache Storage cache lists and entry metadata, each line naming the `reason` that triggered the dump.
 - `storage/`: every state mutation as it happened — `cookie_changes.jsonl` (added/updated/removed cookies with the event that triggered the read), `dom_storage_events.jsonl` (localStorage/sessionStorage changes), and `page_flushes.jsonl` (full dumps sent by the injected script when a page is hidden, frozen, or unloaded).
-- `reports/`: derived human-readable text, CSV, escaped HTML, and `session.har` (HAR 1.2, bodies inlined up to 1 MiB, custom `_`-prefixed fields keep the capture `id`, failures and incompleteness); these are not canonical inputs.
+- `reports/overview.md`: a bounded digest for analysts — pages visited, HTTP errors, network failures (cancellations counted apart), incomplete requests, console errors, uncaught exceptions, API endpoints grouped by method and path (numeric, UUID, hex and token-like segments collapsed to `{id}`), the requests that followed each user action in the same tab within 2 s and before the next action (a heuristic), and hosts. Its headline numbers are also recorded in `manifest.json` under `analysis`.
+- `reports/`: derived human-readable text (`summary.txt` in start order with time and duration), CSV (with `started` and `duration_ms` columns), escaped HTML, and `session.har` (HAR 1.2, bodies inlined up to 1 MiB, custom `_`-prefixed fields keep the capture `id`, failures and incompleteness); these are not canonical inputs.
 
 See the README for CDP visibility limitations and `docs/THREAT_MODEL.md` for confidentiality boundaries.

@@ -28,6 +28,9 @@ class NetworkCaptureMixin:
                     bool(params.get("redirectHasExtraInfo")),
                 )
                 previous["finished"] = self.timestamps.normalize(params.get("timestamp"))
+                # A redirect hop is finished: its response arrived. Without this
+                # a stop during the ExtraInfo grace marked it incomplete.
+                previous["_loadingComplete"] = True
                 self.stats["redirects"] += 1
                 self.stats["responses"] += 1
                 self._schedule_finalize(previous_key, reason="redirect", delay=0.15, hard_delay=2.0)
@@ -49,6 +52,9 @@ class NetworkCaptureMixin:
                 "initiator": copy.deepcopy(params.get("initiator")),
                 "request": request,
             }
+            if "hasUserGesture" in params:
+                # Chrome's own answer to "did a user action start this request?"
+                entry["hasUserGesture"] = bool(params.get("hasUserGesture"))
             key = self.registry.create(session_id, request_id, entry)
             self.stats["requests"] += 1
             post_data = entry["request"].pop("postData", None)
@@ -199,7 +205,15 @@ class NetworkCaptureMixin:
             entry["finished"] = self.timestamps.normalize(params.get("timestamp"))
             entry["_loadingComplete"] = True
             self.stats["failures"] += 1
-            self._schedule_finalize(key, reason="loadingFailed", delay=0.05)
+            delay = 0.05
+            if not (entry.get("response") or {}).get("status"):
+                # A CORS or blocked failure can still have had wire headers
+                # (responseReceivedExtraInfo), which explain the failure. No
+                # responseReceived announced them, so accept them explicitly and
+                # leave a little time for one that is still on its way.
+                self.registry.accept_response_extra_for_failure(key)
+                delay = 0.15
+            self._schedule_finalize(key, reason="loadingFailed", delay=delay)
 
     def _fetch_paused(self, session_id: str | None, params: dict[str, Any]) -> None:
         fetch_id = params.get("requestId")
@@ -230,7 +244,9 @@ class NetworkCaptureMixin:
             if not key or not entry:
                 self.send("Fetch.continueResponse", {"requestId": fetch_id}, session_id)
                 return
-            if not self._should_capture_body(entry) or self._body_must_stream(content_type, header_value):
+            if not self._should_capture_body(entry) or self._body_must_stream(
+                content_type, header_value, str(entry.get("type") or "")
+            ):
                 # Taking the body here would buffer the whole response inside
                 # Chrome, which stalls streamed responses and large downloads.
                 # Let it flow and rely on Network.getResponseBody instead.
@@ -238,6 +254,8 @@ class NetworkCaptureMixin:
                 self.send("Fetch.continueResponse", {"requestId": fetch_id}, session_id)
                 return
             entry["_pendingFetchBody"] = True
+            # responseReceived has not arrived yet at this stage.
+            entry["_pausedStatus"] = status
             self.paused_fetches[fetch_id] = (session_id, key)
             self.send(
                 "Fetch.getResponseBody",
@@ -267,7 +285,8 @@ class NetworkCaptureMixin:
         request = entry.get("request") or {}
         response = entry.get("response") or {}
         failure = entry.get("failure") or {}
-        if not response.get("status"):
+        status_code = response.get("status") or entry.get("_pausedStatus")
+        if not status_code:
             if failure.get("canceled"):
                 return "the request was cancelled before any response arrived"
             error_text = failure.get("errorText")
@@ -277,7 +296,7 @@ class NetworkCaptureMixin:
         method = str(request.get("method") or "GET").upper()
         if method == "HEAD":
             return "HEAD responses have no body"
-        status = int(response.get("status") or 0)
+        status = int(status_code or 0)
         if status in {204, 205, 304}:
             return f"status {status} responses have no body"
         if status in REDIRECT_CODES:
@@ -288,20 +307,34 @@ class NetworkCaptureMixin:
         """Record a failed body command, separating real losses from non-bodies."""
         entry[field] = error
         reason = self._body_unavailable_reason(entry)
-        if reason is None:
-            self.stats["bodyErrors"] += 1
+        if reason is not None:
+            entry.setdefault("responseBodyUnavailableReason", reason)
+        if entry.get("_bodyFailureStat"):
+            # A Fetch-stage failure followed by a failed fallback is one loss.
             return
-        entry.setdefault("responseBodyUnavailableReason", reason)
-        self.stats["bodiesUnavailable"] += 1
+        stat = "bodyErrors" if reason is None else "bodiesUnavailable"
+        entry["_bodyFailureStat"] = stat
+        self.stats[stat] += 1
 
-    def _body_must_stream(self, content_type: str | None, headers: dict[str, str]) -> bool:
-        """Report whether pausing for the body would break or bloat the response."""
+    def _body_must_stream(self, content_type: str | None, headers: dict[str, str], resource_type: str = "") -> bool:
+        """Report whether pausing for the body would break or bloat the response.
+
+        Fetch.getResponseBody holds the whole response inside Chrome until the
+        last byte, so the page sees nothing meanwhile. That is harmless for a
+        sized response, but a script reading a stream (chat UIs stream tokens
+        as chunked text or JSON) would freeze until it ends. Such responses are
+        left to flow; Network.getResponseBody still reads them once loaded.
+        """
         normalized = (content_type or "").lower()
         if any(marker in normalized for marker in STREAMING_CONTENT_TYPES):
             return True
+        if "attachment" in headers.get("content-disposition", "").lower():
+            return True
         length = headers.get("content-length")
+        if resource_type in {"XHR", "Fetch"} and not (length and length.strip().isdigit()):
+            return True
         limit = self.config.max_body_bytes
-        if limit and length and length.isdigit() and int(length) > limit:
+        if limit and length and length.strip().isdigit() and int(length) > limit:
             return True
         return False
 
@@ -385,6 +418,12 @@ class NetworkCaptureMixin:
         if reference:
             entry.setdefault("response", {})["body"] = reference
             self.stats["bodies"] += 1
+            counted = entry.pop("_bodyFailureStat", None)
+            if counted:
+                # An earlier attempt failed but the fallback read the body: it
+                # was not lost. The failed attempt stays on the entry as a note.
+                self.stats[counted] = max(0, self.stats[counted] - 1)
+                entry.pop("responseBodyUnavailableReason", None)
 
     def _should_capture_body(self, entry: dict[str, Any]) -> bool:
         if self.config.body_mode == "none":
@@ -499,10 +538,15 @@ class NetworkCaptureMixin:
         entry["isApi"] = self._is_api(entry)
         if reason:
             entry["finalizeReason"] = reason
-        started_ms = (entry.get("started") or {}).get("epochMs")
-        finished_ms = (entry.get("finished") or {}).get("epochMs")
-        if started_ms is not None and finished_ms is not None:
-            entry["durationMs"] = max(0, finished_ms - started_ms)
+        started = entry.get("started") or {}
+        finished = entry.get("finished") or {}
+        started_mono = started.get("cdpMonotonicSeconds")
+        finished_mono = finished.get("cdpMonotonicSeconds")
+        if isinstance(started_mono, (int, float)) and isinstance(finished_mono, (int, float)):
+            # One clock for both ends: exact, and immune to wall-clock jumps.
+            entry["durationMs"] = max(0, round((finished_mono - started_mono) * 1000))
+        elif started.get("epochMs") is not None and finished.get("epochMs") is not None:
+            entry["durationMs"] = max(0, finished["epochMs"] - started["epochMs"])
         for private_key in [key_name for key_name in entry if key_name.startswith("_")]:
             entry.pop(private_key, None)
         self.store.write_jsonl("network/requests.jsonl", entry, redact=True)
@@ -511,7 +555,10 @@ class NetworkCaptureMixin:
             entry.get("finished") or self.timestamps.normalize(),
             id=entry.get("id"),
             type=entry.get("type"),
+            method=(entry.get("request") or {}).get("method"),
+            url=(entry.get("request") or {}).get("url"),
             isApi=entry.get("isApi"),
             status=(entry.get("response") or {}).get("status"),
             failed=bool(entry.get("failure")),
+            durationMs=entry.get("durationMs"),
         )

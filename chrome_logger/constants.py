@@ -21,4 +21,10 @@ STREAMING_CONTENT_TYPES = (
     "multipart/x-mixed-replace",
     "application/grpc",
     "application/x-ndjson",
+    "application/jsonl",
+    "application/x-jsonlines",
+    "application/json-seq",
+    "application/stream+json",
+    # React Server Components payloads are rendered as they stream.
+    "text/x-component",
 )

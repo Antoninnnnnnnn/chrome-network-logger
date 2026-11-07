@@ -112,10 +112,11 @@ class StateCaptureMixin:
         if not changes:
             return
         self.stats["cookieChanges"] += len(changes)
+        timestamp = self.timestamps.normalize()
         self.store.write_jsonl(
             "storage/cookie_changes.jsonl",
             {
-                "time": self.timestamps.normalize(),
+                "time": timestamp,
                 "reasons": reasons,
                 "baseline": baseline,
                 "cookieCount": len(cookies),
@@ -123,6 +124,22 @@ class StateCaptureMixin:
             },
             redact=True,
         )
+        if not baseline:
+            # Names only: values stay in cookie_changes.jsonl.
+            self.store.timeline(
+                "cookie_change",
+                timestamp,
+                reasons=reasons,
+                changes=[
+                    {
+                        "change": item["change"],
+                        "name": (item.get("cookie") or {}).get("name"),
+                        "domain": (item.get("cookie") or {}).get("domain"),
+                    }
+                    for item in changes[:50]
+                ],
+                changeCount=len(changes),
+            )
 
     def note_response_cookies(self, session_id: str | None, headers: dict[str, Any] | None) -> None:
         """Trigger a cookie read when a response carried Set-Cookie."""
@@ -191,18 +208,31 @@ class StateCaptureMixin:
             else:
                 values[str(item_key)] = params.get("newValue")
         self.stats["storageChanges"] += 1
+        timestamp = self.timestamps.normalize()
+        # Keys only in the timeline: values stay in dom_storage_events.jsonl.
+        self.store.timeline(
+            "storage_change",
+            timestamp,
+            sessionId=session_id,
+            area="localStorage" if is_local else "sessionStorage",
+            origin=origin,
+            change=change,
+            key=item_key,
+        )
         self.store.write_jsonl(
             "storage/dom_storage_events.jsonl",
             {
-                "time": self.timestamps.normalize(),
+                "time": timestamp,
                 "sessionId": session_id,
                 "target": self._target(session_id),
                 "change": change,
                 "storageId": storage_id,
                 "isLocalStorage": is_local,
                 "key": item_key,
-                "newValue": params.get("newValue"),
-                "oldValue": params.get("oldValue"),
+                # The values sit under neutral field names, so redact them
+                # according to the storage key they belong to.
+                "newValue": self.store.redactor.keyed_value(item_key, params.get("newValue")),
+                "oldValue": self.store.redactor.keyed_value(item_key, params.get("oldValue")),
             },
             redact=True,
         )

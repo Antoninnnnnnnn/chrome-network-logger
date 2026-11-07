@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import csv
 import gzip
 import hashlib
+import heapq
 import html
 import json
 import logging
+import math
 import mimetypes
 import os
 import queue
@@ -21,6 +24,7 @@ from . import __version__
 from .config import CaptureConfig
 from .fileio import replace_with_retry
 from .har import write_har
+from .overview import write_overview
 from .redaction import Redactor
 from .session_index import write_session_index
 
@@ -133,6 +137,110 @@ def _csv_safe(value: Any) -> Any:
     return value
 
 
+_TIMELINE_TIME = re.compile(rb'"time":\{"epochMs":(-?\d+(?:\.\d+)?)')
+
+
+def _line_time(line: bytes, previous: float) -> float:
+    """Return the ``time.epochMs`` of a timeline line, or ``previous`` if it has none."""
+    match = _TIMELINE_TIME.search(line, 0, 512)
+    if match:
+        return float(match.group(1))
+    try:
+        return float(json.loads(line)["time"]["epochMs"])
+    except Exception:
+        return previous
+
+
+def sort_jsonl_by_time(path: Path, *, chunk_lines: int = 100_000) -> bool:
+    """Stable-sort a JSONL file on ``time.epochMs`` with bounded memory.
+
+    Events are appended when they are processed, not when they happened: a
+    request is written after its body arrived, a click after the page sent it.
+    Readers expect ``timeline.jsonl`` in time order, so it is sorted once the
+    capture is over. A line without a time keeps the time of the line before
+    it. Returns True when the file was rewritten.
+    """
+    if not path.exists():
+        return False
+    previous = -math.inf
+    ordered = True
+    with open(path, "rb") as source:
+        for line in source:
+            current = _line_time(line, previous)
+            if current < previous:
+                ordered = False
+                break
+            previous = current
+    if ordered:
+        return False
+
+    temporary = path.with_name(path.name + ".tmp")
+    chunks: list[Path] = []
+    try:
+        batch: list[tuple[float, int, bytes]] = []
+        with open(path, "rb") as source:
+            previous = -math.inf
+            for sequence, line in enumerate(source):
+                if not line.endswith(b"\n"):
+                    line += b"\n"
+                previous = _line_time(line, previous)
+                batch.append((previous, sequence, line))
+                if len(batch) >= chunk_lines:
+                    _write_sorted_chunk(chunks, path, batch)
+                    batch = []
+        if not chunks:
+            batch.sort(key=lambda item: (item[0], item[1]))
+            with open(temporary, "wb") as output:
+                output.writelines(item[2] for item in batch)
+        else:
+            if batch:
+                _write_sorted_chunk(chunks, path, batch)
+            batch = []
+            with contextlib.ExitStack() as stack:
+                files = [stack.enter_context(open(chunk, "rb")) for chunk in chunks]
+                # heapq.merge breaks ties by input order, which keeps the sort stable.
+                merged = heapq.merge(*(_read_sorted_chunk(file) for file in files), key=lambda item: item[0])
+                with open(temporary, "wb") as output:
+                    output.writelines(item[1] for item in merged)
+        replace_with_retry(temporary, path)
+        return True
+    finally:
+        for chunk in chunks:
+            chunk.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+
+
+def _write_sorted_chunk(chunks: list[Path], path: Path, batch: list[tuple[float, int, bytes]]) -> None:
+    batch.sort(key=lambda item: (item[0], item[1]))
+    chunk = path.with_name(f"{path.name}.sort{len(chunks)}.tmp")
+    # Registered before writing, so a failure halfway still gets it deleted.
+    chunks.append(chunk)
+    with open(chunk, "wb") as output:
+        for time_ms, _sequence, line in batch:
+            output.write(repr(time_ms).encode("ascii") + b"\t" + line)
+
+
+def _read_sorted_chunk(file: Any) -> Any:
+    for raw in file:
+        prefix, _, line = raw.partition(b"\t")
+        yield float(prefix), line
+
+
+def _json_object(raw: bytes) -> dict[str, Any] | None:
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _clock(epoch_ms: Any) -> str:
+    try:
+        return datetime.fromtimestamp(float(epoch_ms) / 1000).strftime("%H:%M:%S.%f")[:-3]
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "--:--:--.---"
+
+
 class CaptureStore:
     """Canonical session store with one writer thread and external body files."""
 
@@ -170,6 +278,7 @@ class CaptureStore:
         self._closed = False
         self._queue_high_watermark = 0
         self._tasks_written = 0
+        self._analysis: dict[str, Any] | None = None
         self._manifest: dict[str, Any] = {
             "schemaVersion": 3,
             "loggerVersion": __version__,
@@ -401,6 +510,10 @@ class CaptureStore:
                             handle = open(target, "a", encoding="utf-8", buffering=1)
                             handles[relative_path] = handle
                         handle.write(args[0])
+                    elif kind == "close_file":
+                        handle = handles.pop(relative_path, None)
+                        if handle is not None:
+                            handle.close()
                     elif kind == "write_text":
                         temp = target.with_name(target.name + ".tmp")
                         temp.write_text(args[0], encoding="utf-8")
@@ -451,6 +564,16 @@ class CaptureStore:
                 self._queue.all_tasks_done.wait(timeout=0.25)
         self.check_health()
 
+    def close_file(self, relative_path: str) -> None:
+        """Have the writer close its append handle so the file can be replaced."""
+        self._put(("close_file", relative_path, ""))
+
+    def sort_timeline(self) -> None:
+        """Rewrite ``timeline.jsonl`` in time order; see :func:`sort_jsonl_by_time`."""
+        self.close_file("timeline.jsonl")
+        self.flush()
+        sort_jsonl_by_time(self.base / "timeline.jsonl")
+
     def generate_reports(self) -> None:
         self.flush()
         source = self.base / "network" / "requests.jsonl"
@@ -460,21 +583,49 @@ class CaptureStore:
         total = 0
         api_total = 0
         failures = 0
+        http_errors = 0
+        # requests.jsonl is in completion order; the views are in start order.
+        # Only (start, offset) pairs are kept in memory: a session can hold
+        # hundreds of thousands of requests.
+        order: list[tuple[float, int]] = []
+        if source.exists():
+            with open(source, "rb") as input_file:
+                offset = 0
+                for raw in input_file:
+                    position = offset
+                    offset += len(raw)
+                    entry = _json_object(raw)
+                    if entry is None:
+                        continue
+                    started = (entry.get("started") or {}).get("epochMs")
+                    order.append((float(started) if isinstance(started, (int, float)) else math.inf, position))
+        order.sort()
         with (
             open(summary, "w", encoding="utf-8") as summary_file,
             open(csv_path, "w", encoding="utf-8", newline="") as csv_file,
         ):
             writer = csv.DictWriter(
                 csv_file,
-                fieldnames=["id", "type", "method", "status", "is_api", "failed", "url", "response_body"],
+                fieldnames=[
+                    "id",
+                    "type",
+                    "method",
+                    "status",
+                    "is_api",
+                    "failed",
+                    "url",
+                    "response_body",
+                    "started",
+                    "duration_ms",
+                ],
             )
             writer.writeheader()
-            if source.exists():
-                with open(source, encoding="utf-8") as input_file:
-                    for line in input_file:
-                        try:
-                            entry = json.loads(line)
-                        except json.JSONDecodeError:
+            if order:
+                with open(source, "rb") as input_file:
+                    for _start, position in order:
+                        input_file.seek(position)
+                        entry = _json_object(input_file.readline())
+                        if entry is None:
                             continue
                         total += 1
                         resource_type = str(entry.get("type") or "Other")
@@ -488,10 +639,16 @@ class CaptureStore:
                         method = request.get("method") or ("WS" if resource_type == "WebSocket" else "?")
                         url = request.get("url") or entry.get("url") or "?"
                         status = response.get("status", "—")
+                        if isinstance(status, (int, float)) and status >= 400:
+                            http_errors += 1
                         body_path = ((response.get("body") or {}).get("path")) or ""
+                        started = entry.get("started") or {}
+                        duration = entry.get("durationMs")
+                        duration_text = f"{duration}ms" if isinstance(duration, (int, float)) else "-"
+                        flag = "FAIL" if failed else ("INCP" if entry.get("incomplete") else "    ")
                         summary_file.write(
-                            f"[{resource_type:>12}] {str(method):7} {str(status):>4} "
-                            f"{'API' if is_api else '   '} {'FAIL' if failed else '    '} {url}\n"
+                            f"{_clock(started.get('epochMs'))} [{resource_type:>12}] {str(method):7} "
+                            f"{str(status):>4} {'API' if is_api else '   '} {flag} {duration_text:>8} {url}\n"
                         )
                         writer.writerow(
                             {
@@ -503,14 +660,18 @@ class CaptureStore:
                                 "failed": failed,
                                 "url": _csv_safe(url),
                                 "response_body": _csv_safe(body_path),
+                                "started": _csv_safe(started.get("iso") or ""),
+                                "duration_ms": duration if isinstance(duration, (int, float)) else "",
                             }
                         )
+        order = []
         stats_lines = [
             "Chrome Network Logger v3",
             "========================",
             f"Requests: {total}",
             f"API-classified: {api_total}",
             f"Failures: {failures}",
+            f"HTTP errors (status >= 400): {http_errors}",
             "",
             "By resource type:",
         ]
@@ -524,6 +685,12 @@ class CaptureStore:
                 # The HAR is a derived view; losing it must not fail the session.
                 LOG.exception("HAR export failed")
                 self.add_warning(f"HAR export failed with {type(exc).__name__}: {exc}")
+        try:
+            self._analysis = write_overview(self.base)
+        except Exception as exc:
+            # Like the HAR, the overview is derived; the data is already on disk.
+            LOG.exception("Overview report failed")
+            self.add_warning(f"Overview report failed with {type(exc).__name__}: {exc}")
 
     def _generate_interactions_html(self) -> None:
         source = self.base / "interactions" / "events.jsonl"
@@ -590,6 +757,14 @@ class CaptureStore:
         failure: BaseException | None = None
         try:
             self.flush()
+            try:
+                self.sort_timeline()
+            except Exception as exc:
+                # An unsorted timeline is still complete; say so instead of failing.
+                LOG.exception("Timeline sort failed")
+                self.add_warning(
+                    f"timeline.jsonl could not be sorted ({type(exc).__name__}: {exc}); it is in write order"
+                )
             self.generate_reports()
         except BaseException as exc:
             failure = exc
@@ -603,6 +778,8 @@ class CaptureStore:
                     self._manifest["shutdownReason"] = reason
                     if stats is not None:
                         self._manifest["stats"] = stats
+                    if self._analysis is not None:
+                        self._manifest["analysis"] = self._analysis
                     self._manifest["writer"] = {
                         "tasksWritten": self._tasks_written,
                         "queueHighWatermark": self._queue_high_watermark,

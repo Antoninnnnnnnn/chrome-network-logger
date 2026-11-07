@@ -30,14 +30,26 @@ _REASON_MEANING = {
 
 # What each well-known file contains, in reading order.
 _FILE_GUIDE: list[tuple[str, str]] = [
-    ("reports/summary.txt", "One line per request: type, method, status, API flag, failure, URL."),
+    (
+        "reports/overview.md",
+        "READ FIRST. Pages visited, problems (HTTP errors, failures, console errors, exceptions), API endpoints, "
+        "and which user action was followed by which request.",
+    ),
+    (
+        "reports/summary.txt",
+        "One line per request in start order: time, type, method, status, API flag, duration, URL.",
+    ),
     (
         "network/requests.jsonl",
         "CANONICAL. One JSON object per HTTP redirect hop, WebSocket or WebTransport connection.",
     ),
     ("reports/session.har", "The same HTTP traffic as HAR 1.2, bodies inlined up to 1 MiB; opens in DevTools."),
     ("reports/requests.csv", "Spreadsheet view of requests.jsonl (formula-neutralized)."),
-    ("timeline.jsonl", "Every event of every kind merged in time order; use it to correlate."),
+    (
+        "timeline.jsonl",
+        "Requests, user actions, navigations, console errors, exceptions, cookie and storage changes, sorted by "
+        "`time.epochMs`; use it to correlate.",
+    ),
     ("interactions/events.jsonl", "User clicks, inputs, key presses, focus, navigation inside pages."),
     ("interactions/forms.jsonl", "Form submissions with their field values."),
     ("realtime/websocket_frames.jsonl", "WebSocket frames; `connectionId` equals the request `id`."),
@@ -54,7 +66,10 @@ _FILE_GUIDE: list[tuple[str, str]] = [
     ("browser/console.jsonl", "console.* calls."),
     ("browser/exceptions.jsonl", "Uncaught JavaScript exceptions."),
     ("browser/log.jsonl", "Browser Log-domain entries (interventions, network errors, ...)."),
-    ("browser/navigations.jsonl", "Frame navigations and loading start/stop."),
+    (
+        "browser/navigations.jsonl",
+        "Frame navigations, SPA route changes (`navigatedWithinDocument`), loading start/stop.",
+    ),
     ("browser/targets.jsonl", "Tabs, popups, iframes and workers attached/detached."),
     ("browser/protocol_errors.jsonl", "CDP command failures (diagnostics, not application errors)."),
     ("browser/protocol_capabilities.jsonl", "Optional CDP features that were or were not available."),
@@ -81,6 +96,16 @@ _STAT_LABELS: list[tuple[str, str]] = [
     ("cacheEntries", "Cache Storage entries dumped"),
     ("degradedSessions", "Secondary targets captured partially"),
     ("eventErrors", "Internal event-handler errors"),
+]
+
+_ANALYSIS_LABELS: list[tuple[str, str]] = [
+    ("httpErrors", "HTTP errors (status ≥ 400)"),
+    ("networkFailures", "Network failures (excluding cancellations)"),
+    ("consoleErrors", "Console errors"),
+    ("exceptions", "Uncaught exceptions"),
+    ("apiEndpoints", "Distinct API endpoints"),
+    ("pagesVisited", "Top-level page loads and SPA route changes"),
+    ("userActions", "User actions (click, submit, change, key, paste)"),
 ]
 
 
@@ -143,6 +168,15 @@ def render_session_index(manifest: dict[str, Any], session_name: str) -> str:
         "Start here. This file is generated when the capture ends and describes, from the recorded",
         "manifest, what was captured, where it is, and how to read it. Paths are relative to this directory.",
         "",
+        "**Next, read `reports/overview.md`**: it already lists the pages visited, every error, the API endpoints, "
+        "and which user action was followed by which request, so most questions need no scan of the raw files.",
+        "",
+    ]
+    note = str(manifest.get("note") or "").strip()
+    if note:
+        # The operator's own description of the scenario: the context an analyst cannot infer.
+        lines += ["## Operator note", "", *[f"> {line}" for line in note.splitlines()], ""]
+    lines += [
         "## Outcome",
         "",
         f"- **Status:** `{status}` — {_STATUS_MEANING.get(status, 'see manifest.json')}.",
@@ -175,7 +209,9 @@ def render_session_index(manifest: dict[str, Any], session_name: str) -> str:
         if manifest.get("warningsSuppressed"):
             lines.append(f"- {manifest['warningsSuppressed']} further distinct warnings were not recorded.")
 
+    analysis = manifest.get("analysis") or {}
     shown = [(label, stats.get(key)) for key, label in _STAT_LABELS if stats.get(key)]
+    shown += [(label, analysis.get(key)) for key, label in _ANALYSIS_LABELS if analysis.get(key)]
     if shown:
         lines += ["", "## Key numbers", "", "| Measure | Value |", "|---|---:|"]
         lines += [f"| {label} | {value} |" for label, value in shown]
@@ -234,6 +270,9 @@ def render_session_index(manifest: dict[str, Any], session_name: str) -> str:
         "- `incomplete: true` with `incompleteReason` marks a request that never finished loading; "
         "`extraInfoIncomplete: true` only means the raw wire headers did not arrive.",
         "- `sessionId` identifies the tab, iframe or worker; `browser/targets.jsonl` maps it to a URL and type.",
+        "- To find what a click caused, take its `time.epochMs` in `timeline.jsonl` and read the `request_started` "
+        "lines of the same `sessionId` that follow; each request's `initiator` names the script and stack.",
+        "- `network/requests.jsonl` is in completion order, not start order; sort on `started.epochMs` if needed.",
         "- `reports/` files are derived views; `network/requests.jsonl` wins if they disagree.",
         "",
         "## Not captured",

@@ -19,6 +19,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from .fileio import replace_with_retry
+
 LOG = logging.getLogger(__name__)
 
 METADATA_URL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
@@ -225,7 +227,8 @@ def _download_https(
     digest = hashlib.sha256()
     downloaded = 0
     try:
-        report = _download_progress(progress, _declared_size(response, maximum))
+        declared = _declared_size(response, maximum)
+        report = _download_progress(progress, declared)
         with destination.open("wb") as output:
             while chunk := response.read(_COPY_CHUNK_BYTES):
                 downloaded += len(chunk)
@@ -236,6 +239,12 @@ def _download_https(
                 report(downloaded)
         if downloaded == 0:
             raise ManagedChromeError("Official Chrome endpoint returned an empty archive")
+        if declared is not None and downloaded != declared:
+            # http.client returns b"" when the connection drops early instead
+            # of raising, which would otherwise surface as a corrupt ZIP.
+            raise ManagedChromeError(
+                f"The Chrome download was cut off ({downloaded} of {declared} bytes); run the logger again"
+            )
         return digest.hexdigest()
     except ManagedChromeError:
         raise
@@ -440,8 +449,18 @@ def ensure_managed_chrome(
         return cached
 
     notify = progress or (lambda message: LOG.info("%s", message))
-    notify("Chrome is not installed; checking the official Chrome for Testing Stable channel")
-    version, url = _stable_release(platform_id)
+    if cached:
+        notify("Checking the official Chrome for Testing Stable channel for a newer build")
+    else:
+        notify("Chrome is not installed; checking the official Chrome for Testing Stable channel")
+    try:
+        version, url = _stable_release(platform_id)
+    except ManagedChromeError as exc:
+        if not cached:
+            raise
+        # Offline or the metadata endpoint is down: the cached build still works.
+        notify(f"Could not check for a newer Chrome ({exc}); using cached Chrome {cached.version}")
+        return cached
     platform_root = root / platform_id
     version_root = platform_root / version
     executable = version_root / _relative_executable(platform_id)
@@ -493,11 +512,21 @@ def ensure_managed_chrome(
                 },
             )
             try:
-                os.replace(staging, version_root)
+                if version_root.exists():
+                    # Another run published this version meanwhile; retrying
+                    # the rename onto it would only wait for nothing.
+                    raise FileExistsError(str(version_root))
+                replace_with_retry(staging, version_root)
                 staging = None
-            except FileExistsError as exc:
-                if not executable.is_file():
-                    raise ManagedChromeError(f"Managed Chrome cache is incomplete: {version_root}") from exc
+            except OSError as exc:
+                # Renaming onto an existing directory fails with PermissionError
+                # on Windows and ENOTEMPTY elsewhere: another run installed the
+                # same version meanwhile. Use its copy if it is complete.
+                other = _read_manifest(version_root / "install.json")
+                if not (executable.is_file() and other):
+                    raise ManagedChromeError(f"Could not install managed Chrome into {version_root}: {exc}") from exc
+                archive_sha256 = str(other.get("archiveSha256") or archive_sha256)
+                executable_sha256 = str(other.get("executableSha256") or executable_sha256)
             notify(f"Installed managed Chrome {version} in {version_root}")
         finally:
             temporary_archive.unlink(missing_ok=True)
