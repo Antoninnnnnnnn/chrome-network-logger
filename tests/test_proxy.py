@@ -5,7 +5,14 @@ import ssl
 import pytest
 
 from chrome_logger import proxy as proxy_module
-from chrome_logger.proxy import ProxyRelay, ProxySpec, _split_authority, parse_proxy_line, select_proxy
+from chrome_logger.proxy import (
+    ProxyRelay,
+    ProxySpec,
+    _split_authority,
+    build_proxy_route,
+    parse_proxy_line,
+    select_proxy,
+)
 
 
 @pytest.mark.parametrize(
@@ -54,6 +61,58 @@ def test_explicit_proxy_request_fails_when_file_has_no_valid_entries() -> None:
         select_proxy([], "random")
     with pytest.raises(ValueError, match="No valid proxy"):
         select_proxy([], None, prompt=True)
+
+
+def test_proxy_prompt_without_an_interactive_stdin_is_a_value_error(monkeypatch) -> None:
+    def closed_stdin(_prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", closed_stdin)
+    proxies = [ProxySpec("http", "one.example", 8080)]
+    with pytest.raises(ValueError, match="--proxy-prompt needs an interactive terminal"):
+        select_proxy(proxies, None, prompt=True)
+
+
+def test_random_proxy_choices_use_the_random_module(monkeypatch) -> None:
+    proxies = [ProxySpec("http", "one.example", 8080), ProxySpec("http", "two.example", 8080)]
+    monkeypatch.setattr(proxy_module.random, "choice", lambda items: items[-1])
+    assert select_proxy(proxies, "random") is proxies[-1]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")  # Enter at the prompt picks at random
+    assert select_proxy(proxies, None, prompt=True) is proxies[-1]
+
+
+@pytest.mark.parametrize(
+    ("proxy", "argument"),
+    [
+        (ProxySpec("socks5", "socks.example", 1080), "--proxy-server=socks5://socks.example:1080"),
+        (ProxySpec("socks4", "socks.example", 1080), "--proxy-server=socks4://socks.example:1080"),
+        (ProxySpec("socks5", "2001:db8::1", 1080), "--proxy-server=socks5://[2001:db8::1]:1080"),
+    ],
+)
+def test_unauthenticated_socks_goes_straight_to_chrome(proxy: ProxySpec, argument: str) -> None:
+    assert build_proxy_route(proxy) == ([argument], None)
+
+
+def test_authenticated_socks5_is_routed_through_the_relay() -> None:
+    proxy = ProxySpec("socks5", "socks.example", 1080, "alice", "secret")
+    args, relay = build_proxy_route(proxy)
+    assert relay is not None
+    try:
+        assert relay.upstream == proxy
+        assert relay.enabled is True
+        assert args == [f"--proxy-server=http://127.0.0.1:{relay.local_port}"]
+    finally:
+        relay.stop()
+
+
+def test_authenticated_socks4_is_rejected_clearly() -> None:
+    with pytest.raises(ValueError, match="Authenticated SOCKS4 proxies are not supported"):
+        build_proxy_route(ProxySpec("socks4", "socks.example", 1080, "alice", "secret"))
+
+
+def test_relay_rejects_socks4_upstreams() -> None:
+    with pytest.raises(ValueError, match="HTTP, HTTPS and SOCKS5"):
+        ProxyRelay(ProxySpec("socks4", "socks.example", 1080))
 
 
 @pytest.mark.parametrize("verify_tls", [True, False])
